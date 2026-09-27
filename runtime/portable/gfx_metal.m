@@ -3915,6 +3915,8 @@ static struct
     id<MTLTexture> rsm;    /* the middle cascade's casters in colour, as the sun sees them (the bounce light) */
     float rsm_inv[16];     /* that map back to the world less the camera's place */
     id<MTLTexture> ccopy;  /* the world's colour, read by the pass as it writes it */
+    id<MTLTexture> fogt, fogd; /* the volumetric fog at half size: in-scattered light and what gets through, distance */
+    id<MTLRenderPipelineState> fpipe;
     float rel[16];         /* the maps' camera: its clip space to the world less its place (the pass) */
     id<MTLLibrary> dlib;   /* the pass (rt_defer) */
     id<MTLRenderPipelineState> dpipe;
@@ -4304,9 +4306,37 @@ static const char DS_MSL[] =
     "  }\n"
     "  return acc;\n"
     "}\n"
+    /* the fog at half size: each 2x2 block's, at its first pixel (in the colour; its distance beside) */
+    "struct FO { float4 fog [[color(0)]]; float dist [[color(1)]]; };\n"
+    "fragment FO ds_fog_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
+    "                      depth2d_array<float> sm [[texture(1)]]) {\n"
+    "  int2 px = int2(in.pos.xy) * 2 + int2(d.vp.xy);\n"
+    "  float z; float3 p = ds_at(d, dep, px, z);\n"
+    "  float dist = z >= 1.0 ? d.vf2.z : length(p);\n"
+    "  if (z >= 1.0) p = normalize(p) * d.vf2.z;\n"
+    "  FO o; float T; o.fog.rgb = ds_vfog(d, sm, p, dist, T); o.fog.a = T; o.dist = dist;\n"
+    "  return o;\n"
+    "}\n"
+    /* the fog at a pixel dist away: the four blocks round it, each by how near and how alike in distance */
+    "static float4 ds_fog_at(constant DS& d, texture2d<float> ft, texture2d<float> fd, float2 pos, float dist) {\n"
+    "  float2 h = (pos - d.vp.xy) * 0.5 - 0.5;\n"
+    "  int2 b = int2(floor(h)); float2 fr = h - float2(b);\n"
+    "  int2 hi = int2(ft.get_width() - 1, ft.get_height() - 1);\n"
+    "  float4 sum = float4(0.0); float ws = 0.0;\n"
+    "  for (int j = 0; j < 2; ++j)\n"
+    "    for (int i = 0; i < 2; ++i) {\n"
+    "      uint2 t = uint2(clamp(b + int2(i, j), int2(0), hi));\n"
+    "      float w = (i ? fr.x : 1.0 - fr.x) * (j ? fr.y : 1.0 - fr.y) + 1e-3;\n"
+    "      float dd = fd.read(t).r;\n"
+    "      w *= exp(-abs(dd - dist) / (0.05 * dist + 0.5));\n"
+    "      sum += ft.read(t) * w; ws += w;\n"
+    "    }\n"
+    "  return ws > 1e-6 ? sum / ws : ft.read(uint2(clamp(b, int2(0), hi)));\n"
+    "}\n"
     "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
     "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
-    "                      texture2d<float> rsm [[texture(3)]]) {\n"
+    "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
+    "                      texture2d<float> fd [[texture(5)]]) {\n"
     "  int2 px = int2(in.pos.xy);\n"
     "  float4 col = src.read(uint2(px));\n"
     /* rt_debug 6: the bounce light's map itself */
@@ -4325,8 +4355,8 @@ static const char DS_MSL[] =
     "  float3 p = ds_at(d, dep, px, z);\n"
     "  if (z >= 1.0) {\n"
     "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
-    "    float T; float3 fa = ds_vfog(d, sm, normalize(p) * d.vf2.z, d.vf2.z, T);\n"
-    "    return float4(col.rgb * T + fa, col.a);\n"
+    "    float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, d.vf2.z);\n"
+    "    return float4(col.rgb * fo.a + fo.rgb, col.a);\n"
     "  }\n"
     /* the face: toward the nearer neighbour on each axis (the far one may be another object) */
     "  float3 px0 = ds_at(d, dep, px - int2(1, 0), zx0), px1 = ds_at(d, dep, px + int2(1, 0), zx1);\n"
@@ -4340,8 +4370,8 @@ static const char DS_MSL[] =
     "  float dist = length(p);\n"
     "  if (dist >= d.k.y) {\n"
     "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
-    "    float T; float3 fa = ds_vfog(d, sm, p, dist, T);\n"
-    "    return float4(col.rgb * T + fa, col.a);\n"
+    "    float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, dist);\n"
+    "    return float4(col.rgb * fo.a + fo.rgb, col.a);\n"
     "  }\n"
     "  int c = dist < d.cs[0].w ? 0 : dist < d.cs[1].w ? 1 : 2;\n"
     "  float v = ds_look(d, sm, c, p, n);\n"
@@ -4372,7 +4402,7 @@ static const char DS_MSL[] =
     "  float3 oc = col.rgb * (1.0 - a * f);\n"
     /* the bounce light where the sun does not reach (in full sun it is little beside it) */
     "  oc += col.rgb * gi * f * (1.0 - 0.75 * v);\n"
-    "  if (d.vf2.w > 0.0) { float T; float3 fa = ds_vfog(d, sm, p, dist, T); oc = oc * T + fa; }\n"
+    "  if (d.vf2.w > 0.0) { float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, dist); oc = oc * fo.a + fo.rgb; }\n"
     "  return float4(oc, col.a);\n"
     "}\n";
 
@@ -4418,7 +4448,17 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         if (!g_sm.dpipe)
             fprintf(stderr, "[recomp] gfx: rt: shadow pass failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
         g_sm.dfmt = ct.pixelFormat;
-        [vf release], [ff release], [pd release];
+        [ff release];
+        if (!g_sm.fpipe)
+        {
+            ff = [g_sm.dlib newFunctionWithName:@"ds_fog_fs"];
+            pd.fragmentFunction = ff;
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+            pd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Float;
+            g_sm.fpipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            [ff release];
+        }
+        [vf release], [pd release];
         if (!g_sm.dpipe)
             return;
     }
@@ -4492,6 +4532,36 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 sliceCount:1 levelCount:1];
         [b endEncoding];
     }
+    /* the fog at half size first */
+    NSUInteger fw = ((NSUInteger)vp[2] + 1) / 2, fh = ((NSUInteger)vp[3] + 1) / 2;
+    if (!g_sm.fogt || g_sm.fogt.width != fw || g_sm.fogt.height != fh)
+    {
+        [g_sm.fogt release], [g_sm.fogd release];
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:fw
+                                                                                     height:fh mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        g_sm.fogt = [g_dev newTextureWithDescriptor:td];
+        td.pixelFormat = MTLPixelFormatR32Float;
+        g_sm.fogd = [g_dev newTextureWithDescriptor:td];
+    }
+    if (u.vf2[3] > 0.0f && g_sm.fpipe && g_sm.fogt && g_sm.fogd)
+    {
+        MTLRenderPassDescriptor* fp = [MTLRenderPassDescriptor renderPassDescriptor];
+        fp.colorAttachments[0].texture = g_sm.fogt, fp.colorAttachments[1].texture = g_sm.fogd;
+        fp.colorAttachments[0].loadAction = fp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+        fp.colorAttachments[0].storeAction = fp.colorAttachments[1].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> fe = [cmd() renderCommandEncoderWithDescriptor:fp];
+        [fe setRenderPipelineState:g_sm.fpipe];
+        [fe setViewport:(MTLViewport){ 0, 0, (double)fw, (double)fh, 0, 1 }];
+        [fe setFragmentBytes:&u length:sizeof u atIndex:0];
+        [fe setFragmentTexture:dep atIndex:0];
+        [fe setFragmentTexture:g_sm.map atIndex:1];
+        [fe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [fe endEncoding];
+    }
+    else
+        u.vf2[3] = 0.0f;
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = ct;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -4502,6 +4572,8 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     [e setFragmentBytes:&u length:sizeof u atIndex:0];
     [e setFragmentTexture:dep atIndex:0];
     [e setFragmentTexture:g_sm.map atIndex:1];
+    [e setFragmentTexture:g_sm.fogt atIndex:4];
+    [e setFragmentTexture:g_sm.fogd atIndex:5];
     [e setFragmentTexture:g_sm.ccopy atIndex:2];
     [e setFragmentTexture:g_sm.rsm atIndex:3];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
