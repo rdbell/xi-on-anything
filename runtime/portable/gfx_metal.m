@@ -141,7 +141,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1492,6 +1492,9 @@ void gfx_draw(const GfxDraw* d)
 {
     if (!g_dev || !d->count)
         return;
+    /* testing: the 3D alone - no screen-space draws but those of a rendered image (the scene's own) */
+    if (g_fxs.hide_ui != 0.0f && d->vs.rhw && !(d->tex[0] && d->tex[0]->use == GFX_USE_RT))
+        return;
     uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
     scene_mips(d);
     draw_encode(d);
@@ -2299,6 +2302,9 @@ static const struct
     { "rt_distance", offsetof(__typeof__(g_fxs), rt_distance), 150.0f },
     /* how far the near shadow map reaches (the finer one, round the camera), in world units */
     { "rt_near", offsetof(__typeof__(g_fxs), rt_near), 25.0f },
+    { "rt_debug", offsetof(__typeof__(g_fxs), rt_debug), 0.0f },
+    { "hide_ui", offsetof(__typeof__(g_fxs), hide_ui), 0.0f },
+    { "rt_sm_keep", offsetof(__typeof__(g_fxs), rt_sm_keep), 0.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -3017,6 +3023,11 @@ typedef struct RtMesh
     /* this frame's draws of it, and the last one's object to world (rt_anchor) */
     uint64_t drawn;
     uint32_t ndrawn, order; /* and the first of them among the frame's draws */
+    float clip[16][16], clip_prev[16][16]; /* object to clip of its first draws in a frame traced, and the one before's */
+    uint64_t clip_serial, clip_prev_serial;
+    uint32_t nclip, nclip_prev;
+    uint64_t dt_serial; /* its draws so far this frame (rt_frame_camera) */
+    uint32_t dt_n;
     double wd[16];
 } RtMesh;
 
@@ -3083,6 +3094,23 @@ static struct
     float fvp_m[16], fvp_cam[4];
     uint64_t fvp_serial;
     int fvp_ok, fvp_exact;
+    uint32_t cam_draws;             /* draws given a camera this frame (the trace) */
+    double fvp_vp[16];              /* the last exact camera the draws had (world to clip), and its frame */
+    uint64_t fvp_vp_serial;
+    uint32_t cam_from_draws;        /* the profile: frames whose scene took the draws' camera (no anchor drawn) */
+    uint32_t cam_chain;             /* and the last one's, moved on by the meshes drawn in both */
+    uint32_t cam_guessed;           /* and the last one's moved on as it moved (nothing else to go by) */
+    uint32_t cam_fresh;             /* the scene's own, found this frame */
+    uint32_t ch_calls, ch_cand, ch_most, ch_seen, ch_samecount, ch_prev; /* the profile: rt_chain's inputs */
+    const GfxTex* fvp_target;       /* the target the camera above is for: each has its own (a reflection's) */
+    struct { const GfxTex* t; uint64_t serial; int ok, exact, have_pend; float m[16], cam[4], pm[16], pcam[4]; } fvp_slot[4];
+    uint64_t solo_serial;
+    int32_t* solo;                  /* this frame: each mesh's one live place, else -1 (rt_frame_camera) */
+    uint32_t cap_solo;
+    int have_pend;                  /* a camera from a solo place too far from the guess, until another agrees */
+    float pend_m[16], pend_cam[4];
+    double pend_vp[16];
+    uint32_t dr_solo, dr_solo_far;  /* the profile: frames whose camera came from a solo place; ones held */
     float sun_now[4], k_now[4];     /* toward the sun and the shadow's settings, as of the last scene */
     float day;                      /* the sun's share of the light at the last scene (0: none, night) */
     uint64_t enc_pass;              /* the render pass given the structures (useResources) */
@@ -3643,7 +3671,8 @@ static int rt_in_view(const RtMesh* me, const float* w, const float* vp)
 
 /* This frame's camera as the zone's shaders drew with it (vpinv: clip space to the world): each anchor
  * drawn once gives one - its transform through the inverse of where it stands - and the one most of
- * them agree on is taken (an anchor that moved, a door, disagrees and is let go). The scene's camera
+ * them agree on is taken (an anchor that moved, a door, disagrees and is let go; one not drawn for ten
+ * frames gives way to what is drawn now, in the same reference). The scene's camera
  * (the first fogged fixed-function draw's view) is not quite it: placed through that, the zone shifted
  * a little with every turn of the camera. 0 when no anchor was drawn: vpinv is left as it was. */
 static int rt_camera(double* vpinv)
@@ -3668,7 +3697,15 @@ static int rt_camera(double* vpinv)
         g_rtx.anchor[a].seen = g_serial;
     }
     if (!n)
+    {
+        /* none drawn: the ones not drawn for ten frames give way (new ones are found this frame) */
+        uint32_t keep = 0;
+        for (uint32_t a = 0; a < g_rtx.nanchor; ++a)
+            if (g_rtx.anchor[a].seen + 10 >= g_serial)
+                g_rtx.anchor[keep++] = g_rtx.anchor[a];
+        g_rtx.nanchor = keep;
         return 0;
+    }
     uint32_t best = 0, most = 0;
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -3691,7 +3728,7 @@ static int rt_camera(double* vpinv)
             drop[idx[j]] = 1;
     }
     for (uint32_t a = 0; a < g_rtx.nanchor; ++a)
-        if (!drop[a] && g_rtx.anchor[a].seen + RT_KEEP >= g_serial)
+        if (!drop[a] && g_rtx.anchor[a].seen + 10 >= g_serial) /* not drawn for a while: others in its stead */
             g_rtx.anchor[keep++] = g_rtx.anchor[a];
     g_rtx.nanchor = keep;
     /* the mean of the ones that agree (one alone jumps by its own rounding as the choice changes) */
@@ -3712,6 +3749,76 @@ static int rt_camera(double* vpinv)
     /* the profile: how far apart the agreeing ones are, and from the scene's camera */
     g_rtx.cam_spread = fmax(g_rtx.cam_spread, sqrt(spread));
     g_rtx.cam_agree += na;
+    return 1;
+}
+
+/* This frame's camera from the last traced one's (vpinv: clip to the world): a mesh drawn once in both,
+ * still, went from clip_prev = W VP_last to clip = W VP, so VP = VP_last clip_prev^-1 clip whatever W
+ * is. The one most of them agree on (what moved disagrees); 0 when fewer than two agree. */
+static int rt_chain(double* vpinv)
+{
+    if (!g_rtx.have_vp_last || !g_rtx.prev)
+        return 0;
+    enum { N = 256 };
+    static double cand[N][16], cam[N][3];
+    uint32_t n = 0;
+    /* a mesh drawn as many times (up to sixteen) in both: its draws paired in the order drawn (a pairing
+     * that is wrong, or a draw that moved, disagrees with the rest) */
+    g_rtx.ch_calls++;
+    for (uint32_t i = 0; i < g_rtx.nmesh && n < N; ++i)
+    {
+        const RtMesh* me = &g_rtx.mesh[i];
+        if (me->clip_serial == g_serial && me->nclip)
+        {
+            g_rtx.ch_seen++;
+            g_rtx.ch_samecount += me->nclip == me->nclip_prev;
+            g_rtx.ch_prev += me->clip_prev_serial == g_rtx.vp_last_serial;
+        }
+        /* (what the places call unstable too: a camera off makes them so, and this does not use them) */
+        if (me->clip_serial != g_serial || !me->nclip || me->nclip > 16 || me->nclip != me->nclip_prev ||
+            me->clip_prev_serial != g_rtx.vp_last_serial)
+            continue;
+        for (uint32_t d = 0; d < me->nclip && n < N; ++d)
+        {
+            double a[16], b[16], ia[16], step[16], vp[16];
+            for (int j = 0; j < 16; ++j)
+                a[j] = me->clip_prev[d][j], b[j] = me->clip[d][j];
+            if (!matd_inverse(ia, a))
+                continue;
+            matd_mul(step, ia, b);
+            matd_mul(vp, g_rtx.vp_last, step);
+            if (!matd_inverse(cand[n], vp) || fabs(cand[n][11]) < 1e-12)
+                continue;
+            for (int k = 0; k < 3; ++k)
+                cam[n][k] = cand[n][8 + k] / cand[n][11];
+            n++;
+        }
+    }
+    uint32_t best = 0, most = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t agree = 0;
+        for (uint32_t j = 0; j < n; ++j)
+        {
+            double dx = cam[i][0] - cam[j][0], dy = cam[i][1] - cam[j][1], dz = cam[i][2] - cam[j][2];
+            agree += dx * dx + dy * dy + dz * dz < 1e-4;
+        }
+        if (agree > most)
+            most = agree, best = i;
+    }
+    g_rtx.ch_cand += n, g_rtx.ch_most += most;
+    if (most < 2)
+        return 0;
+    double sum[16] = { 0 };
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        double dx = cam[best][0] - cam[j][0], dy = cam[best][1] - cam[j][1], dz = cam[best][2] - cam[j][2];
+        if (dx * dx + dy * dy + dz * dz < 1e-4)
+            for (int k = 0; k < 16; ++k)
+                sum[k] += cand[j][k] / cand[j][11];
+    }
+    for (int k = 0; k < 16; ++k)
+        vpinv[k] = sum[k] / most;
     return 1;
 }
 
@@ -3928,6 +4035,8 @@ static void rt_map_draw(id<MTLTexture> target, const SmCascade* k, id<MTLBuffer>
     [e endEncoding];
 }
 
+static void rt_cam_log(const char* what);
+
 /* this scene's maps (vpinv: its camera, clip to the world); the draws of the next look themselves up */
 static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger dyn_off, uint32_t dyn_verts)
 {
@@ -3936,13 +4045,20 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
         return;
     double cam[3] = { vpinv[8] / vpinv[11], vpinv[9] / vpinv[11], vpinv[10] / vpinv[11] };
     memcpy(g_sm.cam, cam, sizeof cam);
+    {
+        char w[96];
+        snprintf(w, sizeof w, "maps at %.3f %.3f %.3f", cam[0], cam[1], cam[2]);
+        rt_cam_log(w);
+    }
     double L[3] = { g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2] };
     v3_normalize(L);
     double dfar = fmax(g_fxs.rt_distance, 4.0), dnear = fmin(fmax(g_fxs.rt_near, 0.0), dfar);
     if (!rt_cascade(vpinv, cam, L, 0.5, dfar, &g_sm.far))
         return;
     g_sm.have_near = dnear >= 2.0 && dnear < dfar && rt_cascade(vpinv, cam, L, 0.5, dnear, &g_sm.near);
-    /* the instances, grouped by mesh: every place kept and every one placed this frame alone */
+    /* the instances, grouped by mesh: every place kept (rt_sm_keep: only those drawn in its last frames)
+     * and every one placed this frame alone */
+    uint64_t keep = g_fxs.rt_sm_keep >= 1.0f ? (uint64_t)g_fxs.rt_sm_keep : RT_KEEP;
     uint32_t total = 0;
     for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
         g_rtx.mesh[i].sm_count = 0;
@@ -3950,7 +4066,7 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
     {
         int kept = i < g_rtx.nplace;
         RtMesh* me = &g_rtx.mesh[kept ? g_rtx.place[i].mesh : g_rtx.now[i - g_rtx.nplace].mesh];
-        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + RT_KEEP < g_serial)) || me->dead || !me->rtv || !me->tris)
+        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + keep < g_serial)) || me->dead || !me->rtv || !me->tris)
             continue;
         me->sm_count++, total++;
     }
@@ -3965,7 +4081,7 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
         int kept = i < g_rtx.nplace;
         const float* pw = kept ? g_rtx.place[i].w : g_rtx.now[i - g_rtx.nplace].w;
         RtMesh* me = &g_rtx.mesh[kept ? g_rtx.place[i].mesh : g_rtx.now[i - g_rtx.nplace].mesh];
-        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + RT_KEEP < g_serial)) || me->dead || !me->rtv || !me->tris)
+        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + keep < g_serial)) || me->dead || !me->rtv || !me->tris)
             continue;
         float* o = w + 16 * (me->sm_first + me->sm_count++);
         memcpy(o, pw, 64);
@@ -3989,7 +4105,7 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
  * transform through the camera's inverse); a mesh new to it is captured in its own space (clip space
  * back through the inverse of that transform). The rest - what moves, or a shader that places its
  * vertices some other way - is captured in the world, every frame. */
-static int rt_frame(const float* clip_world, const float* view_world, const float* view, const float* proj)
+static int rt_frame(const float* clip_world, const float* view_world, const float* view, const float* proj, int fresh)
 {
     if (!rt_init())
         return 0;
@@ -4031,10 +4147,41 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         me->ndrawn++;
         for (int j = 0; j < 16; ++j)
             me->wd[j] = wvp[j];
+        if (me->clip_serial != g_serial)
+        {
+            memcpy(me->clip_prev, me->clip, sizeof me->clip);
+            me->clip_prev_serial = me->clip_serial, me->nclip_prev = me->nclip;
+            me->clip_serial = g_serial, me->nclip = 0;
+        }
+        if (me->nclip < 16)
+            memcpy(me->clip[me->nclip], wvp, 64);
+        me->nclip++;
     }
     double scene_inv[16];
     memcpy(scene_inv, vpinv, sizeof scene_inv);
     int anchored = have_vpinv && rt_camera(vpinv);
+    /* no anchor drawn: the last frame's camera moved on as the meshes drawn in both moved (its own step,
+     * the world's transforms cancelling), else the camera the draws found this frame (a mesh at its one
+     * place) - in the same reference, before the scene's own, which can be far off and would start anew */
+    if (!anchored && have_vpinv && rt_chain(vpinv))
+        anchored = 1, g_rtx.cam_chain++;
+    if (!anchored && g_rtx.fvp_vp_serial == g_serial && matd_inverse(vpinv, g_rtx.fvp_vp))
+        anchored = 1, g_rtx.cam_from_draws++;
+    /* none of those: the last camera moved on as it moved the frame before - the same reference, off by
+     * little - unless the scene's camera is its own this frame (a fixed-function draw's: exact), or it
+     * jumped (a new zone): an earlier scene's is far off, and taken it would start another reference,
+     * every place kept then misplaced */
+    if (!anchored && fresh)
+        g_rtx.cam_fresh++; /* the scene's own camera, found this frame: as good as an anchor */
+    else if (!anchored && !jumped && g_rtx.have_vp_last && g_rtx.vp_last_serial + 30 >= g_serial)
+    {
+        double guess[16], ib[16], step[16];
+        memcpy(guess, g_rtx.vp_last, sizeof guess);
+        if (g_rtx.have_vp_prev && g_rtx.vp_last_serial + 1 == g_serial && matd_inverse(ib, g_rtx.vp_prev))
+            matd_mul(step, g_rtx.vp_last, ib), matd_mul(guess, step, g_rtx.vp_last);
+        if (matd_inverse(vpinv, guess))
+            anchored = 1, g_rtx.cam_guessed++;
+    }
     if (anchored && fabs(scene_inv[11]) > 1e-12 && fabs(vpinv[11]) > 1e-12)
     {
         double d = 0.0;
@@ -4559,12 +4706,57 @@ static int rt_draw_key(const GfxDraw* d, CacheKey* k)
     return 1;
 }
 
+/* FFXI_RTCAM=<file>: each change of the draws' camera, for tracing */
+static void rt_cam_log(const char* what)
+{
+    static FILE* f;
+    static int tried, lines;
+    if (!tried)
+        tried = 1, f = getenv("FFXI_RTCAM") ? fopen(getenv("FFXI_RTCAM"), "w") : NULL;
+    if (!f || ++lines > 200000)
+        return;
+    fprintf(f, "%llu t%p %s cam %.3f %.3f %.3f ok %d exact %d draw %u\n", (unsigned long long)g_serial, (void*)g_rt, what,
+        g_rtx.fvp_cam[0], g_rtx.fvp_cam[1], g_rtx.fvp_cam[2], g_rtx.fvp_ok, g_rtx.fvp_exact, g_rtx.cam_draws);
+}
+
 /* the frame's camera for a zone's draw, as far as the draws so far give it (rd.m, rd.cam) */
 static int rt_frame_camera(const GfxDraw* d, RtDraw* rd)
 {
+    /* each target drawn this frame has a camera of its own: the one left kept, the one come to
+     * restored (the game draws the world into more than one - a reflection, the characters) */
+    if (g_rtx.fvp_serial == g_serial && g_rtx.fvp_target != g_rt)
+    {
+        int put = 0, got = -1;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (g_rtx.fvp_slot[i].serial != g_serial || g_rtx.fvp_slot[i].t == g_rtx.fvp_target)
+                put = i;
+            if (g_rtx.fvp_slot[i].serial == g_serial && g_rtx.fvp_slot[i].t == g_rt)
+                got = i;
+        }
+        if (got == put)
+            got = -1;
+        __typeof__(g_rtx.fvp_slot[0])* o = &g_rtx.fvp_slot[put];
+        o->t = g_rtx.fvp_target, o->serial = g_serial, o->ok = g_rtx.fvp_ok, o->exact = g_rtx.fvp_exact;
+        o->have_pend = g_rtx.have_pend;
+        memcpy(o->m, g_rtx.fvp_m, 64), memcpy(o->cam, g_rtx.fvp_cam, 16);
+        memcpy(o->pm, g_rtx.pend_m, 64), memcpy(o->pcam, g_rtx.pend_cam, 16);
+        g_rtx.fvp_target = g_rt;
+        if (got >= 0)
+        {
+            const __typeof__(g_rtx.fvp_slot[0])* q = &g_rtx.fvp_slot[got];
+            g_rtx.fvp_ok = q->ok, g_rtx.fvp_exact = q->exact, g_rtx.have_pend = q->have_pend;
+            memcpy(g_rtx.fvp_m, q->m, 64), memcpy(g_rtx.fvp_cam, q->cam, 16);
+            memcpy(g_rtx.pend_m, q->pm, 64), memcpy(g_rtx.pend_cam, q->pcam, 16);
+            g_rtx.fvp_slot[got].serial = 0;
+            rt_cam_log("restore");
+        }
+        else
+            g_rtx.fvp_serial = 0; /* new to this frame: from the guess */
+    }
     if (g_rtx.fvp_serial != g_serial)
     {
-        g_rtx.fvp_serial = g_serial, g_rtx.fvp_exact = 0;
+        g_rtx.fvp_serial = g_serial, g_rtx.fvp_exact = 0, g_rtx.have_pend = 0, g_rtx.fvp_target = g_rt;
         /* the last camera, moved on by as much as it moved the frame before: last * (before^-1 * last)
          * in D3D's order (world to clip: the step is a move of the world, then the camera) */
         double guess[16], ib[16], step[16];
@@ -4572,10 +4764,102 @@ static int rt_frame_camera(const GfxDraw* d, RtDraw* rd)
         if (g_rtx.have_vp_prev && g_rtx.vp_last_serial + 1 == g_serial && matd_inverse(ib, g_rtx.vp_prev))
             matd_mul(step, g_rtx.vp_last, ib), matd_mul(guess, step, g_rtx.vp_last);
         g_rtx.fvp_ok = g_rtx.have_vp_last && rt_ray_camera(guess, g_rtx.fvp_m, g_rtx.fvp_cam);
+        g_rtx.cam_draws = 0;
+        rt_cam_log("guess");
     }
+    g_rtx.cam_draws++;
     CacheKey k;
     float wvp[16];
-    if (!g_rtx.fvp_exact && g_rtx.nanchor && rt_draw_key(d, &k))
+    int keyed = rt_draw_key(d, &k);
+    /* A mesh the world keeps at just one place is an anchor too, from each of its draws: the camera
+     * is the draw's transform less the place's (most of the zone's meshes are drawn at one place, the
+     * first draws of a frame among them - before any of the anchors). Taken when it is within half a unit
+     * of the guess;
+     * one elsewhere is held until a second agrees - a cut, or a second view of the world drawn in the
+     * same frame (the title's flythrough cross-fades two), which then takes over. */
+    if (keyed)
+    {
+        if (g_rtx.cap_solo < g_rtx.nmesh || g_rtx.solo_serial != g_serial)
+        {
+            if (g_rtx.cap_solo < g_rtx.nmesh)
+                g_rtx.cap_solo = g_rtx.nmesh + 1024, g_rtx.solo = (int32_t*)realloc(g_rtx.solo, g_rtx.cap_solo * sizeof *g_rtx.solo);
+            for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+                g_rtx.solo[i] = -1;
+            for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+            {
+                const RtPlace* p = &g_rtx.place[i];
+                if (p->gone || p->seen + 60 < g_serial || g_rtx.mesh[p->mesh].unstable)
+                    continue;
+                int32_t* o = &g_rtx.solo[p->mesh];
+                *o = *o == -1 ? (int32_t)i : -2;
+            }
+            g_rtx.solo_serial = g_serial;
+        }
+        uintptr_t at = (uintptr_t)map_get(&g_rtx.map, &k, sizeof k);
+        RtMesh* me = at && at - 1 < g_rtx.nmesh ? &g_rtx.mesh[at - 1] : NULL;
+        int32_t pi = me ? g_rtx.solo[at - 1] : -1;
+        uint32_t nth = 0;
+        if (me)
+        {
+            if (me->dt_serial != g_serial)
+                me->dt_serial = g_serial, me->dt_n = 0;
+            nth = me->dt_n++;
+        }
+        double iw[16], wd[16], vp[16], w[16];
+        float m[16], cam[4];
+        /* the camera from the mesh's same draw last frame: VP = VP_last clip_last^-1 clip (its transform
+         * to the world cancels) - any mesh drawn as often then; else from its one place */
+        int chain = me && g_rtx.have_vp_last && me->clip_serial == g_rtx.vp_last_serial && me->clip_serial + 1 == g_serial &&
+            nth < me->nclip && nth < 16;
+        if ((chain || pi >= 0) && rt_wvp_u(&d->u, &d->vs, d->vs_tokens, wvp))
+        {
+            int got;
+            for (int j = 0; j < 16; ++j)
+                wd[j] = wvp[j];
+            if (chain)
+            {
+                double a[16], ia[16], step[16];
+                for (int j = 0; j < 16; ++j)
+                    a[j] = me->clip[nth][j];
+                got = matd_inverse(ia, a) && (matd_mul(step, ia, wd), matd_mul(vp, g_rtx.vp_last, step), 1);
+            }
+            else
+            {
+                for (int j = 0; j < 16; ++j)
+                    w[j] = g_rtx.place[pi].w[j];
+                got = matd_inverse(iw, w) && (matd_mul(vp, iw, wd), 1);
+            }
+            if (got && rt_ray_camera(vp, m, cam))
+            {
+                float dg = 0.0f, dp = 0.0f;
+                for (int j = 0; j < 3; ++j)
+                    dg += (cam[j] - g_rtx.fvp_cam[j]) * (cam[j] - g_rtx.fvp_cam[j]),
+                    dp += (cam[j] - g_rtx.pend_cam[j]) * (cam[j] - g_rtx.pend_cam[j]);
+                int take;
+                if (g_rtx.fvp_exact)
+                    take = dg < 0.25f ? 2 : g_rtx.have_pend && dp < 0.01f; /* 2: the same camera, as it is */
+                else
+                    take = (g_rtx.fvp_ok && dg < 0.25f) || (g_rtx.have_pend && dp < 0.01f);
+                if (take == 1)
+                {
+                    const char* why = g_rtx.fvp_exact ? "solo-switch" : "solo";
+                    memcpy(g_rtx.fvp_m, m, 64), memcpy(g_rtx.fvp_cam, cam, 16);
+                    memcpy(g_rtx.fvp_vp, vp, sizeof vp), g_rtx.fvp_vp_serial = g_serial;
+                    g_rtx.fvp_ok = g_rtx.fvp_exact = 1, g_rtx.have_pend = 0, g_rtx.dr_solo++;
+                    rt_cam_log(why);
+                }
+                else if (!take)
+                {
+                    memcpy(g_rtx.pend_m, m, 64), memcpy(g_rtx.pend_cam, cam, 16), memcpy(g_rtx.pend_vp, vp, sizeof vp);
+                    g_rtx.have_pend = 1, g_rtx.dr_solo_far++;
+                    rt_cam_log("solo-held");
+                }
+                keyed = !g_rtx.fvp_exact;
+            }
+        }
+    }
+    keyed = keyed && !g_rtx.fvp_exact;
+    if (keyed && g_rtx.nanchor)
         for (uint32_t a = 0; a < g_rtx.nanchor; ++a)
         {
             if (memcmp(&k, &g_rtx.anchor[a].key, sizeof k))
@@ -4587,7 +4871,8 @@ static int rt_frame_camera(const GfxDraw* d, RtDraw* rd)
                     wd[j] = wvp[j];
                 matd_mul(vp, iw, wd);
                 if (rt_ray_camera(vp, g_rtx.fvp_m, g_rtx.fvp_cam))
-                    g_rtx.fvp_ok = 1, g_rtx.fvp_exact = 1;
+                    g_rtx.fvp_ok = 1, g_rtx.fvp_exact = 1, memcpy(g_rtx.fvp_vp, vp, sizeof vp),
+                    g_rtx.fvp_vp_serial = g_serial, rt_cam_log("anchor");
             }
             break;
         }
@@ -4621,7 +4906,7 @@ static void rt_draw_bind(const GfxDraw* d, id<MTLRenderCommandEncoder> e)
     if (ok)
     {
         memcpy(rd.sun, g_rtx.sun_now, 16);
-        rd.k[0] = g_rtx.k_now[0], rd.k[2] = g_rtx.k_now[2], rd.k[3] = 1.0f / RT_MAP;
+        rd.k[0] = g_rtx.k_now[0], rd.k[1] = g_fxs.rt_debug, rd.k[2] = g_rtx.k_now[2], rd.k[3] = 1.0f / RT_MAP;
         const SmCascade* n = g_sm.have_near ? &g_sm.near : &g_sm.far;
         memcpy(rd.sn, n->m, 64), memcpy(rd.sf, g_sm.far.m, 64);
         /* the maps are relative to their scene's camera, the draw's place to its own: moved by the
@@ -4877,7 +5162,7 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 g_rtx.sun_now[3] = strength > 0.0f ? g_rtx.sun_now[3] : 0.0f;
                 g_rtx.k_now[0] = strength, g_rtx.k_now[2] = fmaxf(g_fxs.rt_distance, 1.0f);
                 if (mat_inverse(invP, s->proj))
-                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj);
+                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj, s->cam != 0);
                 memcpy(u.ivp, g_rtx.ray_ivp, 64), memcpy(u.cam, g_rtx.ray_cam, 12);
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
@@ -4967,18 +5252,20 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     g_rtx.late_used = 0;
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
-                        "last frame's, %u fixed-function, %u with none; sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
+                        "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
                         "instances, %u draws, texels %.3f / %.3f units\n", g_rtx.dr_exact,
-                        g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
+                        g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
                         g_sm.drawn, g_sm.have_near ? g_sm.near.texel : 0.0, g_sm.far.texel),
-                    g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = 0;
+                    g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: camera from anchors %u frames (%.1f agreeing, spread at most %.5f units), the "
-                        "scene's %u; %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,
+                        "scene's %u; %u chained, %u from the draws, %u the scene's own, %u guessed (chain: %u tries, %u meshes drawn, %u as often as before, %u drawn the frame before, %u pairs, %u agreeing); %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,
                         g_rtx.anchored ? (double)g_rtx.cam_agree / g_rtx.anchored : 0.0, g_rtx.cam_spread, g_rtx.anchor_fallback,
-                        g_rtx.nanchor, g_rtx.cam_scene, g_rtx.zones),
-                    g_rtx.zones = 0,
+                        g_rtx.cam_chain, g_rtx.cam_from_draws, g_rtx.cam_fresh, g_rtx.cam_guessed, g_rtx.ch_calls, g_rtx.ch_seen, g_rtx.ch_samecount, g_rtx.ch_prev,
+                        g_rtx.ch_cand, g_rtx.ch_most, g_rtx.nanchor, g_rtx.cam_scene, g_rtx.zones),
+                    g_rtx.zones = 0, g_rtx.cam_from_draws = g_rtx.cam_chain = g_rtx.cam_guessed = g_rtx.cam_fresh = 0,
+                    g_rtx.ch_calls = g_rtx.ch_cand = g_rtx.ch_most = g_rtx.ch_seen = g_rtx.ch_samecount = g_rtx.ch_prev = 0,
                     g_rtx.anchored = g_rtx.anchor_fallback = g_rtx.cam_agree = 0, g_rtx.cam_spread = g_rtx.cam_scene = 0.0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: places: %u as kept, %u moved, %u new, %u drawn again; "

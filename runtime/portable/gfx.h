@@ -263,6 +263,8 @@ typedef struct GfxScene
     float fogcolor[4];
     float fog[4];        /* fog start, end; z = 1 when fog was on */
     uint32_t vp[6];      /* the viewport the 3D draws used (D3DVIEWPORT8) */
+    uint32_t cam;        /* view and proj are this scene's own (a fixed-function draw's: 2 fogged, 1 not); 0: an
+                          * earlier scene's, the zone's shaders placing everything */
 } GfxScene;
 
 /* The frame's 3D scene is finished in color (a render target's first level, drawn with depth

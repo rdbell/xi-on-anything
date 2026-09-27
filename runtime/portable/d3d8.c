@@ -2890,6 +2890,7 @@ static void scene_finish(const char* why)
     if (g_scene.draws && !g_scene.done && g_scene.cam && (!g_scene.world || g_scene.rt == g_scene.world) &&
         !g_scene.world_done)
     {
+        g_scene.s.cam = g_scene.cam_rank;
         gfx_scene_done(g_scene.rt, &g_scene.s);
         g_scene.world_done = 1;
         g_scene.tr_why = why[0] == 's' && why[1] == 'w' ? 'w' : why[0], g_scene.tr_draws = g_scene.draws;
@@ -3182,6 +3183,27 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     scene_note(d);
     if (g_cap)
         cap_draw(d, prim, count, first, nverts, up_data, up_stride);
+    if (g_cap && d->vs.prog && d->vs_tokens) /* the vertex shader and its first constants */
+    {
+        static uint32_t done[256];
+        static int ndone;
+        int seen = 0;
+        for (int i = 0; i < ndone; ++i)
+            seen |= done[i] == d->vs.prog;
+        if (!seen && ndone < 256)
+        {
+            done[ndone++] = d->vs.prog;
+            fprintf(g_cap, "  vs %08x tokens", d->vs.prog);
+            for (const uint32_t* t = d->vs_tokens; *t != 0x0000FFFF && t - d->vs_tokens < 400; ++t)
+                fprintf(g_cap, " %08x", *t);
+            fprintf(g_cap, "\n");
+        }
+        fprintf(g_cap, "  vsc");
+        for (int r = 0; r < 16; ++r)
+            fprintf(g_cap, " c%d %.4g %.4g %.4g %.4g |", r, g_dev.cur.vsc[r][0], g_dev.cur.vsc[r][1], g_dev.cur.vsc[r][2],
+                g_dev.cur.vsc[r][3]);
+        fprintf(g_cap, "\n");
+    }
     if (d->vs.rhw && (g_dev.rt == g_dev.backbuffer || menu_target(obj(g_dev.rt))))
     {
         /* the game's cursor is drawn where the mouse was given to it: squeezed when that was

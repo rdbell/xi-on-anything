@@ -458,7 +458,7 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 static void emit_rt_shadow(Sb* b)
 {
     sb_printf(b,
-        "  float rt_vis = 1.0, rt_w = 0.0;\n"
+        "  float rt_vis = 1.0, rt_w = 0.0, rt_c = 0.0;\n"
         "  {\n"
         "    float nn = dot(rt_n, rt_n), dist = length(in.wp);\n"
         "    if (rd.sun.w > 0.0 && nn > 1e-20 && dist < rd.k.z) {\n"
@@ -473,6 +473,7 @@ static void emit_rt_shadow(Sb* b)
         "        float step = rd.c.w, bias = rd.bz.x;\n"
         "        if (!nr) q = rd.sf * float4(in.wp + n * rd.c.z, 1.0), step = rd.k.w, bias = rd.bz.y;\n"
         "        if (all(abs(q.xy) < 1.0) && q.z > 0.0 && q.z < 1.0) {\n"
+        "          rt_c = nr ? 1.0 : 2.0;\n"
         "          float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
         "          float s = 0.0, z = q.z - bias;\n"
         "          for (int j = -1; j <= 1; ++j)\n"
@@ -514,6 +515,9 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
         }
         sb_printf(b, "  %s.rgb = mix(u.fogcolor.rgb, %s.rgb, f);\n", col, col);
     }
+    /* rd.k.y: the shadow alone (lit white, shadowed black; near map green, far red, neither blue) */
+    if (k->rt)
+        sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : float3(1.0, 0.75, 0.75));\n", col);
     sb_printf(b, "  return %s;\n}\n", col);
 }
 
