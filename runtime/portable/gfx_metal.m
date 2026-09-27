@@ -3026,6 +3026,7 @@ static struct
     float ray_cam[3], ray_ivp[16];
     float late_cw[16], late_vw[16]; /* the camera of the frame traced before (its draws after the effects) */
     uint32_t late_used;             /* the profile: their triangles traced */
+    uint32_t zones;                 /* the profile: new zones (everything kept let go) */
     double cam_spread, cam_scene; /* the profile: the anchors' spread, the most the scene's camera is off */
     uint32_t cam_agree;
     uint32_t pl_far, pl_full; /* draws not placed: out of the world (far off, not finite), their mesh at RT_PLACES */
@@ -3659,10 +3660,11 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         return 0;
     if (gfx_profiling)
         rt_projections(proj);
+    /* the camera 50 units from the last: a new zone - when no anchor is drawn either (below): the scene's
+     * camera alone is now and then another draw's view, hundreds of units off */
     const float* cam = view_world + 12;
     float jx = cam[0] - g_rtx.cam[0], jy = cam[1] - g_rtx.cam[1], jz = cam[2] - g_rtx.cam[2];
-    if (jx * jx + jy * jy + jz * jz > 50.0f * 50.0f) /* a new zone */
-        rt_trim(1);
+    int jumped = jx * jx + jy * jy + jz * jz > 50.0f * 50.0f;
     memcpy(g_rtx.cam, cam, 12);
     if (!(g_serial & 127))
         rt_trim(0);
@@ -3707,7 +3709,25 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     }
     g_rtx.anchored += anchored, g_rtx.anchor_fallback += !anchored;
     if (!anchored) /* no anchor drawn: a new frame of reference (the scene's camera), anchors found anew */
+    {
         g_rtx.nanchor = 0;
+        if (jumped) /* and the camera far from the last: a new zone, all of the last one's gone */
+        {
+            rt_trim(1), rt_hash(), g_rtx.zones++;
+            for (uint32_t i = 0; i < g_ncasters; ++i) /* this frame's draws counted again, of new meshes */
+            {
+                const Caster* c = &g_casters[i];
+                float wvp[16];
+                if (!c->fixed || !rt_wvp(c, wvp))
+                    continue;
+                uint32_t mi = rt_mesh(c);
+                RtMesh* me = &g_rtx.mesh[mi];
+                if (me->drawn != g_serial)
+                    me->drawn = g_serial, me->ndrawn = 0;
+                me->ndrawn++;
+            }
+        }
+    }
     /* the frame's camera, from here on: the world to clip (the places' culling), clip to the world (what
      * moves), and for the rays */
     if (anchored)
@@ -4371,9 +4391,10 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     g_rtx.late_used = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: camera from anchors %u frames (%.1f agreeing, spread at most %.5f units), the "
-                        "scene's %u; %u anchors; the scene's camera off by at most %.4f units\n", g_rtx.anchored,
+                        "scene's %u; %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,
                         g_rtx.anchored ? (double)g_rtx.cam_agree / g_rtx.anchored : 0.0, g_rtx.cam_spread, g_rtx.anchor_fallback,
-                        g_rtx.nanchor, g_rtx.cam_scene),
+                        g_rtx.nanchor, g_rtx.cam_scene, g_rtx.zones),
+                    g_rtx.zones = 0,
                     g_rtx.anchored = g_rtx.anchor_fallback = g_rtx.cam_agree = 0, g_rtx.cam_spread = g_rtx.cam_scene = 0.0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: places: %u as kept, %u moved, %u new, %u drawn again; "
