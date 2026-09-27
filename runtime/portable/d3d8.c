@@ -2943,10 +2943,15 @@ static void scene_note(GfxDraw* d)
             g_scene.tally[i].n++;
             break;
         }
+    /* opaque 3D of the world not in its scene: traced with the next one (the back end's ray tracing) */
+    int opaque = d->depth.zwrite && (!d->pipe.blend || (d->fs.alpha_func && d->fs.alpha_func != 8));
     /* 3D into other targets - the game draws characters into one partway through the world, then
      * goes on with the world - is not the world's scene: it neither ends nor starts one */
     if (g_scene.world && c != g_scene.world)
+    {
+        d->caster = opaque ? 2 : 0;
         return;
+    }
     if (c != g_scene.rt) /* a new scene: the one before is done; the new one's camera and sun are its own */
     {
         scene_finish("switch");
@@ -2955,6 +2960,7 @@ static void scene_note(GfxDraw* d)
     if (g_scene.done) /* 3D again after the effects ran: drawn as it is */
     {
         g_scene.st_late++, g_scene.tr_late++;
+        d->caster = opaque ? 2 : 0;
         return;
     }
     g_scene.draws++;

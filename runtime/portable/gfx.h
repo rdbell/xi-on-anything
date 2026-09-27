@@ -190,7 +190,9 @@ typedef struct GfxDraw
     GfxTex* tex[8];
     GfxSampler samp[8];
     uint8_t cull;   /* D3DCULL */
-    uint8_t caster; /* an opaque draw of the frame's 3D scene: it casts the sun's shadow */
+    uint8_t caster; /* 1: an opaque draw of the frame's 3D scene: it casts the sun's shadow; 2: one of the
+                     * world's drawn after the scene's effects ran (characters, some frames): traced
+                     * with the next frame's scene (the back end's ray tracing), no shadow map */
     uint8_t fill;   /* D3DFILLMODE */
     int32_t zbias;  /* D3DRS_ZBIAS */
     uint32_t stencil_ref;

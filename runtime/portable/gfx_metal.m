@@ -1224,6 +1224,45 @@ typedef struct Caster
 
 static Caster* g_casters;
 static uint32_t g_ncasters, g_casters_cap;
+/* the world's opaque draws after its scene's effects ran (GfxDraw.caster 2): traced with the next scene,
+ * through the camera of theirs (rt_frame) */
+static Caster* g_late;
+static uint32_t g_nlate, g_late_cap;
+static uint64_t g_late_serial; /* the frame they were drawn in */
+
+static void caster_release(Caster* c)
+{
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        [c->vb[s] release];
+    [c->ub release];
+    [c->ib release];
+    for (int t = 0; t < 8; ++t)
+        [c->tex[t] release];
+}
+
+static void late_clear(void)
+{
+    for (uint32_t i = 0; i < g_nlate; ++i)
+        caster_release(&g_late[i]);
+    g_nlate = 0;
+}
+
+static Caster* late_new(const GfxDraw* d)
+{
+    if (g_late_serial != g_serial) /* the frame's first: those of frames before go */
+        late_clear(), g_late_serial = g_serial;
+    if (g_nlate == g_late_cap)
+    {
+        g_late_cap = g_late_cap ? g_late_cap * 2 : 256;
+        g_late = (Caster*)realloc(g_late, g_late_cap * sizeof(Caster));
+    }
+    Caster* c = &g_late[g_nlate++];
+    memset(c, 0, sizeof *c);
+    c->lib.vs = d->vs, c->lib.fs = d->fs;
+    c->vs = d->vs_tokens, c->ps = d->ps_tokens;
+    c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
+    return c;
+}
 
 static void casters_clear(void)
 {
@@ -1488,13 +1527,14 @@ static void draw_encode(const GfxDraw* d)
         memcpy(u, &d->u, need);
         [g_enc setVertexBuffer:buf offset:off atIndex:4];
         [g_enc setFragmentBuffer:buf offset:off atIndex:4];
-        if (d->caster && !g_rt_face && !g_rt_level)
+        if (d->caster == 1 && !g_rt_face && !g_rt_level)
         {
             id<MTLTexture> dw = depth_attachment();
             if (dw && g_rt->depth_world != dw)
                 [g_rt->depth_world release], g_rt->depth_world = [dw retain];
         }
-        Caster* rec = d->caster && g_fxs.fx != 0.0f && (g_fxs.sun > 0.0f || g_fxs.rt > 0.0f) ? caster_new(d) : NULL;
+        Caster* rec = d->caster == 1 && g_fxs.fx != 0.0f && (g_fxs.sun > 0.0f || g_fxs.rt > 0.0f) ? caster_new(d)
+            : d->caster == 2 && g_fxs.fx != 0.0f && g_fxs.rt > 0.0f && !g_rt_face && !g_rt_level ? late_new(d) : NULL;
         if (rec)
             rec->ub = [buf retain], rec->uoff = off;
         for (int s = 0; s < GFX_NSTREAMS; ++s)
@@ -2984,6 +3024,8 @@ static struct
     /* this frame's camera for the rays: its place in the world, and clip space to the world less that
      * place (small numbers: precise in float) */
     float ray_cam[3], ray_ivp[16];
+    float late_cw[16], late_vw[16]; /* the camera of the frame traced before (its draws after the effects) */
+    uint32_t late_used;             /* the profile: their triangles traced */
     double cam_spread, cam_scene; /* the profile: the anchors' spread, the most the scene's camera is off */
     uint32_t cam_agree;
     uint32_t pl_far, pl_full; /* draws not placed: out of the world (far off, not finite), their mesh at RT_PLACES */
@@ -3706,7 +3748,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         uint32_t m;
         float sm[16];
     } Job;
-    Job* jobs = (Job*)malloc(((size_t)g_ncasters + 1) * sizeof(Job));
+    Job* jobs = (Job*)malloc(((size_t)g_ncasters + g_nlate + 1) * sizeof(Job));
     uint32_t njobs = 0, dyn_verts = 0, tris = 0;
     g_rtx.waiting = 0;
     for (uint32_t i = 0; i < g_ncasters; ++i)
@@ -3797,6 +3839,26 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             rt_matrix(c, clip_world, view_world, j->sm), dyn_verts += j->m;
         njobs++;
     }
+    /* the world's draws out of its scene (characters, some frames): after the effects of the scene
+     * traced before, through that frame's camera; into another target before this scene, through this
+     * one's - in the world, with what moves */
+    int late_now = g_late_serial == g_serial, late_before = g_rtx.prev && g_late_serial == g_rtx.prev;
+    if (late_now || late_before)
+        for (uint32_t i = 0; i < g_nlate; ++i)
+        {
+            const Caster* c = &g_late[i];
+            id<MTLRenderPipelineState> p = rt_pipeline(c);
+            if (!p)
+                continue;
+            Job* j = &jobs[njobs];
+            j->m = rt_ids(c, &j->ids, &j->ids_off);
+            if (!j->m)
+                continue;
+            j->c = c, j->mi = UINT32_MAX, j->p = p;
+            rt_matrix(c, late_now ? clip_world : g_rtx.late_cw, late_now ? view_world : g_rtx.late_vw, j->sm);
+            dyn_verts += j->m, g_rtx.late_used += j->m / 3;
+            njobs++;
+        }
     /* anchors for the frames after: meshes drawn once this frame that hold still, where they stand now
      * (in this frame's reference: the anchors' camera, or the scene's when no anchor was drawn) */
     for (uint32_t i = 0; i < g_rtx.nmesh && g_rtx.nanchor < 8; ++i)
@@ -3882,6 +3944,9 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     }
     g_rtx.built = nstatic;
     g_rtx.prev = g_serial;
+    /* this frame's camera, for what the world draws after its effects (traced with the next scene) */
+    memcpy(g_rtx.late_cw, clip_world, 64), memcpy(g_rtx.late_vw, view_world, 64);
+    late_clear(); /* encoded: the command buffer holds what it reads */
     free(jobs);
     /* a place kept that the camera looks at (its mesh's box well inside the view) and the game has
      * not drawn for three frames traced is not there any more: a nearer or farther detail of the mesh
@@ -4300,9 +4365,10 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     "%u cached; map %.0f units across; sun %.2f %.2f %.2f\n", g_fx.st_frames, g_fx.st_own, g_fx.st_map, g_fx.st_cmin,
                     g_fx.st_cmax, g_fx.st_cached, g_fx.st_across, g_fx.sunw[0], g_fx.sunw[1], g_fx.sunw[2]);
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
-                    fprintf(stderr, "[recomp] gfx: rt: %u meshes, %u instances (%u triangles), %u moving triangles, %u built "
-                        "this frame, %u waiting\n", g_rtx.nkept, g_rtx.ninst, g_rtx.kept_tris, g_rtx.moving_tris, g_rtx.built,
-                        g_rtx.waiting);
+                    fprintf(stderr, "[recomp] gfx: rt: %u meshes, %u instances (%u triangles), %u moving triangles (%u drawn "
+                        "after the effects, 2 s), %u built this frame, %u waiting\n", g_rtx.nkept, g_rtx.ninst, g_rtx.kept_tris,
+                        g_rtx.moving_tris, g_rtx.late_used, g_rtx.built, g_rtx.waiting),
+                    g_rtx.late_used = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: camera from anchors %u frames (%.1f agreeing, spread at most %.5f units), the "
                         "scene's %u; %u anchors; the scene's camera off by at most %.4f units\n", g_rtx.anchored,
