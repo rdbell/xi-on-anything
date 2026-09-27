@@ -140,7 +140,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1800,6 +1800,7 @@ static const char FX_MSL[] =
     "  float4x4 vw;   // view space to the world (the ray tracing's)\n"
     "  float4x4 ivp;  // clip space to the world less the camera's place (the rays')\n"
     "  float4 cam;    // the camera's place in the world (the rays')\n"
+    "  float4 sunw;   // toward the sun (or moon) in the world; w = 1 when the scene has one\n"
     "};\n"
     "struct FO { float4 pos [[position]]; float2 uv; };\n"
     "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
@@ -2115,7 +2116,7 @@ static const char FX_MSL[] =
 typedef struct FxU
 {
     float proj[4], zp[4], vp[4], size[4], ao[4], grade[4], hand[4], up[4], sun[4], suncol[4], sunuv[4], fogc[4], fogp[4],
-        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4], vw[16], ivp[16], cam[4];
+        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4], vw[16], ivp[16], cam[4], sunw[4];
 } FxU;
 
 static struct
@@ -2215,6 +2216,10 @@ static const struct
     /* how a fixed-function caster's triangles go back to the world: 1 through its own matrices (clip,
      * object, view, world), 0 through the scene's camera like the vertex shaders' */
     { "rt_proj", offsetof(__typeof__(g_fxs), rt_proj), 1.0f },
+    /* a sun of the tester's own for the traced scene (debug = 6): its height over the horizon and
+     * its bearing, in degrees; elevation 0 keeps the game's */
+    { "rt_sun_elev", offsetof(__typeof__(g_fxs), rt_sun_elev), 0.0f },
+    { "rt_sun_azim", offsetof(__typeof__(g_fxs), rt_sun_azim), 0.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -2823,8 +2828,8 @@ static int sun_map(const GfxScene* s, const float* L, FxU* u)
  * frame, into one structure.
  * The instance structure over all of it is built every frame.
  *
- * debug = 6 shows the traced scene against the drawn one: clay, lit from above by the face each ray
- * hits, where the hit agrees with the depth drawn; red where the ray hits nearer (a mesh kept where
+ * debug = 6 shows the traced scene against the drawn one: clay, lit by the scene's sun with a shadow
+ * ray toward it from each hit, where the hit agrees with the depth drawn; red where the ray hits nearer (a mesh kept where
  * nothing is now), blue where it hits farther or nothing (a surface drawn that the structures lack),
  * yellow where it hits something in the sky. */
 enum { RT_BUILDS = 256, RT_BUILD_TRIS = 400000 };
@@ -2879,8 +2884,23 @@ static const char RT_MSL[] =
     "      }\n"
     "      n = normalize(h.object_to_world_transform * float4(n, 0.0));\n"
     "      if (dot(n, r.direction) > 0.0) n = -n;\n"
-    /* FFXI's world y points down: the light comes from above */
-    "      float lit = 0.3 + 0.7 * saturate(dot(n, normalize(float3(0.35, -0.8, 0.45))));\n"
+    /* lit by the scene's sun (or moon), and shaded where a ray toward it hits anything: a shadow
+     * from anything kept, in view or not; with no sun, from above (FFXI's world y points down) */
+    "      float3 L = u.sunw.w > 0.0 ? normalize(u.sunw.xyz) : normalize(float3(0.35, -0.8, 0.45));\n"
+    "      float nl = saturate(dot(n, L)), vis = 1.0;\n"
+    "      if (u.sunw.w > 0.0 && nl > 0.0) {\n"
+    "        ray sr;\n"
+    "        sr.origin = r.origin + r.direction * h.distance + n * max(0.002 * h.distance, 0.01);\n"
+    "        sr.direction = L;\n"
+    "        sr.min_distance = 0.0;\n"
+    "        sr.max_distance = 1e4;\n"
+    "        intersector<triangle_data, instancing> sx;\n"
+    "        sx.assume_geometry_type(geometry_type::triangle);\n"
+    "        sx.force_opacity(forced_opacity::opaque);\n"
+    "        sx.accept_any_intersection(true);\n"
+    "        if (sx.intersect(sr, as).type != intersection_type::none) vis = 0.0;\n"
+    "      }\n"
+    "      float lit = 0.25 + 0.75 * nl * vis;\n"
     "      c = float3(0.85, 0.82, 0.78) * lit * mix(1.0, 0.5, saturate(h.distance / 200.0));\n"
     "    }\n"
     "  }\n"
@@ -4190,6 +4210,14 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 if (mat_inverse(invP, s->proj))
                     mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj);
                 memcpy(u.ivp, g_rtx.ray_ivp, 64), memcpy(u.cam, g_rtx.ray_cam, 12);
+                /* the sun as the effects keep it: in the world, the last a lit draw gave */
+                memcpy(u.sunw, g_fx.sunw, 12), u.sunw[3] = u.sun[3];
+                if (g_fxs.rt_sun_elev != 0.0f)
+                {
+                    /* the tester's sun: FFXI's world y points down */
+                    float el = g_fxs.rt_sun_elev * (float)M_PI / 180.0f, az = g_fxs.rt_sun_azim * (float)M_PI / 180.0f;
+                    u.sunw[0] = cosf(el) * cosf(az), u.sunw[1] = -sinf(el), u.sunw[2] = cosf(el) * sinf(az), u.sunw[3] = 1.0f;
+                }
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
             u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
