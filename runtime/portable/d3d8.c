@@ -2306,6 +2306,7 @@ static int build_draw(GfxDraw* d)
     mat_mul(wv, s->xf[24], s->xf[2]);
     mat_mul(d->u.wvp, wv, s->xf[3]);
     memcpy(d->u.wv, wv, 64);
+    mat_mul(d->view_proj, s->xf[2], s->xf[3]);
     normal_matrix(d->u.wvit, wv);
     for (int i = 0; i < 8; ++i)
         memcpy(d->u.texm[i], s->xf[16 + i], 64);

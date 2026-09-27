@@ -111,6 +111,7 @@ static SDL_MetalView g_view;
 static SDL_Window* g_window;
 static id<MTLCommandBuffer> g_cmd;
 static id<MTLRenderCommandEncoder> g_enc;
+static uint64_t g_pass_serial; /* render passes begun so far: what a pass has been given (rt_draw_bind) */
 static dispatch_semaphore_t g_frames_sem;
 static Frame g_frames[FRAMES];
 static uint32_t g_frame;              /* index into g_frames */
@@ -140,7 +141,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -875,6 +876,7 @@ static int begin_pass(void)
     }
     g_pending_clear = 0;
     g_enc = [[cmd() renderCommandEncoderWithDescriptor:p] retain];
+    g_pass_serial++;
     g_rt->used = g_serial;
     if (!g_rt_face && !g_rt_level)
         g_rt->scene = 0; /* drawn to: its mips are behind */
@@ -1177,6 +1179,11 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey* k, const uint32_t*
     return st && st != PIPE_FAILED ? (id)st : nil;
 }
 
+static int rt_draw_wanted(const GfxDraw* d);
+static void rt_draw_bind(const GfxDraw* d, id<MTLRenderCommandEncoder> e);
+static int rt_inpass(void);
+static int g_draw_rt; /* the draw being encoded has a traced pipeline (pipeline) */
+
 static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
 {
     PipeKey k;
@@ -1190,7 +1197,16 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     k.depth = depth ? (uint32_t)depth.pixelFormat : 0;
     k.stencil = depth && g_ds->has_stencil ? k.depth : 0;
     k.x8 = (uint8_t)g_rt->x8;
+    /* the world's opaque draws traced: shaded by the scene's triangles as they are drawn (rt_draw_bind) */
+    if (rt_draw_wanted(d))
+        k.lib.vs.rt = k.lib.fs.rt = 1;
     id<MTLRenderPipelineState> p = pipeline_for(&k, d->vs_tokens, d->ps_tokens);
+    if (!p && k.lib.vs.rt)
+    {
+        /* traced, still building: drawn as it was meanwhile */
+        k.lib.vs.rt = k.lib.fs.rt = 0;
+        p = pipeline_for(&k, d->vs_tokens, d->ps_tokens);
+    }
     if (!p && k.lib.vs.pixel)
     {
         /* lit per pixel, still building: lit per vertex meanwhile (a new mix of the game's lights
@@ -1198,6 +1214,7 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
         k.lib.vs.pixel = 0;
         p = pipeline_for(&k, d->vs_tokens, d->ps_tokens);
     }
+    g_draw_rt = p && k.lib.vs.rt;
     return p;
 }
 
@@ -1219,7 +1236,9 @@ typedef struct Caster
     uint32_t n, vstart;
     uint8_t itype; /* 0 no indices, 2 or 4 bytes each */
     uint8_t fixed; /* every vertex and index from buffers the game keeps (the zone's): cached (sun_cache) */
+    uint8_t has_cw;
     int32_t zbias;
+    float cw[16]; /* a fixed-function draw's clip space back to the world, its own view and projection's */
 } Caster;
 
 static Caster* g_casters;
@@ -1440,6 +1459,7 @@ static MTLPrimitiveType metal_prim(uint32_t prim)
 }
 
 static void draw_encode(const GfxDraw* d);
+static int matd_inverse(double* out, const double* m);
 
 /* The scene filter: a large render target drawn smaller onto a large target (FFXI's world onto the
  * back buffer - or the copy of it the game shows some frames, while the camera moves) is sampled
@@ -1527,6 +1547,8 @@ static void draw_encode(const GfxDraw* d)
         memcpy(u, &d->u, need);
         [g_enc setVertexBuffer:buf offset:off atIndex:4];
         [g_enc setFragmentBuffer:buf offset:off atIndex:4];
+        if (g_draw_rt)
+            rt_draw_bind(d, g_enc);
         if (d->caster == 1 && !g_rt_face && !g_rt_level)
         {
             id<MTLTexture> dw = depth_attachment();
@@ -1536,7 +1558,18 @@ static void draw_encode(const GfxDraw* d)
         Caster* rec = d->caster == 1 && g_fxs.fx != 0.0f && (g_fxs.sun > 0.0f || g_fxs.rt > 0.0f) ? caster_new(d)
             : d->caster == 2 && g_fxs.fx != 0.0f && g_fxs.rt > 0.0f && !g_rt_face && !g_rt_level ? late_new(d) : NULL;
         if (rec)
+        {
             rec->ub = [buf retain], rec->uoff = off;
+            if (!d->vs.prog) /* the fixed function's own camera: its clip space back to the world */
+            {
+                double vp[16], inv[16];
+                for (int j = 0; j < 16; ++j)
+                    vp[j] = d->view_proj[j];
+                if (matd_inverse(inv, vp))
+                    for (int j = 0; j < 16; ++j)
+                        rec->cw[j] = (float)inv[j], rec->has_cw = 1;
+            }
+        }
         for (int s = 0; s < GFX_NSTREAMS; ++s)
         {
             if (d->buf[s])
@@ -2260,6 +2293,12 @@ static const struct
      * its bearing, in degrees; elevation 0 keeps the game's */
     { "rt_sun_elev", offsetof(__typeof__(g_fxs), rt_sun_elev), 0.0f },
     { "rt_sun_azim", offsetof(__typeof__(g_fxs), rt_sun_azim), 0.0f },
+    /* the traced sun shadows, in the world's own draws: how much of a surface's colour the shadow
+     * takes (0: none - and the sun's maps back), and how far out they reach, in world units */
+    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.5f },
+    { "rt_distance", offsetof(__typeof__(g_fxs), rt_distance), 150.0f },
+    /* how far the near shadow map reaches (the finer one, round the camera), in world units */
+    { "rt_near", offsetof(__typeof__(g_fxs), rt_near), 25.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -2911,15 +2950,15 @@ static const char RT_MSL[] =
     "    float e = h.distance - dd;\n"
     "    if (abs(e) > max(0.05 * dd, 0.3)) c = e < 0.0 ? float3(1.0, 0.15, 0.1) : float3(0.1, 0.3, 1.0);\n"
     "    else {\n"
-    /* each vertex a position and a normal; the normals, where the vertices came with them (the low
-     * bit of the address), blended across the triangle: smooth; else the face's */
+    /* each vertex a position, a normal and texture coordinates; the normals, where the vertices came
+     * with them (the low bit of the address), blended across the triangle: smooth; else the face's */
     "      ulong at = vtx[h.instance_id];\n"
     "      device const float4* v = (device const float4*)(at & ~1ul);\n"
-    "      uint p = h.primitive_id * 6u;\n"
-    "      float3 f = cross(v[p + 2].xyz - v[p].xyz, v[p + 4].xyz - v[p].xyz), n = f;\n"
+    "      uint p = h.primitive_id * 9u;\n"
+    "      float3 f = cross(v[p + 3].xyz - v[p].xyz, v[p + 6].xyz - v[p].xyz), n = f;\n"
     "      if (at & 1ul) {\n"
     "        float2 bc = h.triangle_barycentric_coord;\n"
-    "        float3 s = v[p + 1].xyz * (1.0 - bc.x - bc.y) + v[p + 3].xyz * bc.x + v[p + 5].xyz * bc.y;\n"
+    "        float3 s = v[p + 1].xyz * (1.0 - bc.x - bc.y) + v[p + 4].xyz * bc.x + v[p + 7].xyz * bc.y;\n"
     "        if (dot(s, s) > 1e-8) n = dot(s, f) < 0.0 ? -s : s;\n"
     "      }\n"
     "      n = normalize(h.object_to_world_transform * float4(n, 0.0));\n"
@@ -2938,7 +2977,7 @@ static const char RT_MSL[] =
     "        sx.assume_geometry_type(geometry_type::triangle);\n"
     "        sx.force_opacity(forced_opacity::opaque);\n"
     "        sx.accept_any_intersection(true);\n"
-    "        if (sx.intersect(sr, as).type != intersection_type::none) vis = 0.0;\n"
+    "        if (sx.intersect(sr, as, 3u).type != intersection_type::none) vis = 0.0;\n"
     "      }\n"
     "      float lit = 0.25 + 0.75 * nl * vis;\n"
     "      c = float3(0.85, 0.82, 0.78) * lit * mix(1.0, 0.5, saturate(h.distance / 200.0));\n"
@@ -2968,9 +3007,16 @@ typedef struct RtMesh
     uint64_t captured; /* the frame it was captured in */
     int bounds;
     int normals; /* its vertices came with normals (smooth shading); else the faces' */
+    /* alpha-tested: its first texture, how it is sampled and the test's reference (the shadow maps let
+     * through what the test lets through) */
+    int alpha;
+    id<MTLTexture> tex;
+    GfxSampler samp;
+    float aref;
+    uint32_t sm_count, sm_first; /* its places in this frame's shadow maps' instance list */
     /* this frame's draws of it, and the last one's object to world (rt_anchor) */
     uint64_t drawn;
-    uint32_t ndrawn;
+    uint32_t ndrawn, order; /* and the first of them among the frame's draws */
     double wd[16];
 } RtMesh;
 
@@ -3019,7 +3065,7 @@ static struct
     uint32_t pl_gone; /* places dropped: in view, not drawn */
     /* the anchors: meshes drawn once a frame, where they stand (object to world), from which each frame's
      * camera is found (rt_camera) */
-    struct { uint32_t mesh; double w[16]; uint64_t seen; } anchor[8];
+    struct { uint32_t mesh; double w[16]; uint64_t seen; CacheKey key; } anchor[8];
     uint32_t nanchor, anchored, anchor_fallback;
     /* this frame's camera for the rays: its place in the world, and clip space to the world less that
      * place (small numbers: precise in float) */
@@ -3027,6 +3073,20 @@ static struct
     float late_cw[16], late_vw[16]; /* the camera of the frame traced before (its draws after the effects) */
     uint32_t late_used;             /* the profile: their triangles traced */
     uint32_t zones;                 /* the profile: new zones (everything kept let go) */
+    /* the world's draws traced (rt_draw_bind): the camera of the frame traced last (world to clip), and
+     * this frame's as the draws find it - the last one's until an anchor is drawn, then that one's */
+    int render_ok;                  /* rays from the draws' own functions (supportsRaytracingFromRender) */
+    double vp_last[16], vp_prev[16]; /* and the one of the frame before it */
+    int have_vp_last, have_vp_prev;
+    uint64_t vp_last_serial;
+    double fvp[16];
+    float fvp_m[16], fvp_cam[4];
+    uint64_t fvp_serial;
+    int fvp_ok, fvp_exact;
+    float sun_now[4], k_now[4];     /* toward the sun and the shadow's settings, as of the last scene */
+    float day;                      /* the sun's share of the light at the last scene (0: none, night) */
+    uint64_t enc_pass;              /* the render pass given the structures (useResources) */
+    uint32_t dr_exact, dr_pred, dr_ffp, dr_none; /* the profile: traced draws, by the camera they had */
     double cam_spread, cam_scene; /* the profile: the anchors' spread, the most the scene's camera is off */
     uint32_t cam_agree;
     uint32_t pl_far, pl_full; /* draws not placed: out of the world (far off, not finite), their mesh at RT_PLACES */
@@ -3071,7 +3131,9 @@ static int rt_init(void)
         return 0;
     }
     g_rtx.ok = 1;
-    fprintf(stderr, "[recomp] gfx: ray tracing ready (%s)\n", [[g_dev name] UTF8String]);
+    g_rtx.render_ok = [g_dev supportsRaytracingFromRender];
+    fprintf(stderr, "[recomp] gfx: ray tracing ready (%s%s)\n", [[g_dev name] UTF8String],
+        g_rtx.render_ok ? "" : "; not from the draws: no traced shadows");
     return 1;
 }
 
@@ -3113,8 +3175,9 @@ static id<MTLRenderPipelineState> rt_pipeline(const Caster* cs)
     v->lighting = v->normalize = v->localviewer = v->specular = 0;
     v->src_diffuse = v->src_specular = v->src_ambient = v->src_emissive = 0;
     v->nlights = 0, memset(v->light_type, 0, sizeof v->light_type);
-    v->fog_vertex = v->range_fog = 0, v->ntex = 0, v->flat = 0;
-    memset(v->tci, 0, sizeof v->tci), memset(v->ttf, 0, sizeof v->ttf);
+    v->fog_vertex = v->range_fog = 0, v->flat = 0;
+    if (!alpha_tested(&cs->lib.fs)) /* the texture coordinates only where the texture decides what is there */
+        v->ntex = 0, memset(v->tci, 0, sizeof v->tci), memset(v->ttf, 0, sizeof v->ttf);
     return pipeline_for(&pk, cs->vs, NULL);
 }
 
@@ -3137,6 +3200,11 @@ static void rt_capture(id<MTLRenderCommandEncoder> e, id<MTLRenderPipelineState>
 static void rt_matrix(const Caster* c, const float* clip_world, const float* view_world, float* out)
 {
     memcpy(out, clip_world, 64);
+    if (!c->lib.vs.prog && c->has_cw) /* its own view and projection's */
+    {
+        memcpy(out, c->cw, 64);
+        return;
+    }
     if (c->lib.vs.prog || g_fxs.rt_proj == 0.0f || !c->ub)
         return;
     const GfxU* u = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
@@ -3191,7 +3259,7 @@ static void rt_projections(const float* proj)
 static MTLPrimitiveAccelerationStructureDescriptor* rt_blas_desc(id<MTLBuffer> v, NSUInteger off, uint32_t ntri)
 {
     MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-    g.vertexBuffer = v, g.vertexBufferOffset = off, g.vertexStride = 32, g.triangleCount = ntri, g.opaque = YES; /* position, normal */
+    g.vertexBuffer = v, g.vertexBufferOffset = off, g.vertexStride = 48, g.triangleCount = ntri, g.opaque = YES; /* position, normal, uv */
     MTLPrimitiveAccelerationStructureDescriptor* d = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
     d.geometryDescriptors = @[ g ];
     return d;
@@ -3219,6 +3287,7 @@ static void rt_mesh_release(RtMesh* me)
         [me->c.vb[s] release];
     [me->c.ib release];
     rt_release_later(me->rtv), rt_release_later(me->blas);
+    [me->tex release];
 }
 
 /* a buffer the game changed or let go of: the meshes drawn from it are captured again if drawn again */
@@ -3320,10 +3389,16 @@ static void rt_trim(int all)
 
 /* the caster's object space to its clip space (row vectors): the fixed function's wvp, or the four
  * constants a vertex shader's position transform reads; 0 when it is not one matrix */
+static int rt_wvp_u(const GfxU* u, const GfxVsKey* vs, const uint32_t* tokens, float* out);
+
 static int rt_wvp(const Caster* c, float* out)
 {
-    const GfxU* u = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
-    if (!c->lib.vs.prog)
+    return rt_wvp_u((const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff), &c->lib.vs, c->vs, out);
+}
+
+static int rt_wvp_u(const GfxU* u, const GfxVsKey* vs, const uint32_t* tokens, float* out)
+{
+    if (!vs->prog)
     {
         memcpy(out, u->wvp, 64);
         return 1;
@@ -3331,16 +3406,16 @@ static int rt_wvp(const Caster* c, float* out)
     int k = -1;
     uint32_t i = 0;
     for (; i < g_rtx.npos; ++i)
-        if (g_rtx.pos_prog[i] == c->lib.vs.prog)
+        if (g_rtx.pos_prog[i] == vs->prog)
             break;
     if (i < g_rtx.npos)
         k = g_rtx.pos_k[i];
     else
     {
-        k = gfx_msl_vs1_pos_consts(c->vs);
+        k = gfx_msl_vs1_pos_consts(tokens);
         if (g_rtx.npos < 64)
-            g_rtx.pos_prog[g_rtx.npos] = c->lib.vs.prog, g_rtx.pos_k[g_rtx.npos++] = k;
-        fprintf(stderr, "[recomp] gfx: rt: vertex shader %08x places its vertices %s%d\n", c->lib.vs.prog,
+            g_rtx.pos_prog[g_rtx.npos] = vs->prog, g_rtx.pos_k[g_rtx.npos++] = k;
+        fprintf(stderr, "[recomp] gfx: rt: vertex shader %08x places its vertices %s%d\n", vs->prog,
             k >= 0 ? "through c" : "some other way ", k);
     }
     if (k < 0 || k + 3 >= GFX_NVSC)
@@ -3533,7 +3608,7 @@ static int rt_bounds(RtMesh* me)
         me->lo[k] = 1e30f, me->hi[k] = -1e30f;
     for (uint32_t i = 0; i < n; ++i)
         for (int k = 0; k < 3; ++k)
-            me->lo[k] = fminf(me->lo[k], v[8 * i + k]), me->hi[k] = fmaxf(me->hi[k], v[8 * i + k]);
+            me->lo[k] = fminf(me->lo[k], v[12 * i + k]), me->hi[k] = fmaxf(me->hi[k], v[12 * i + k]);
     me->bounds = n && me->lo[0] <= me->hi[0];
     return me->bounds;
 }
@@ -3649,6 +3724,266 @@ static uint32_t rt_most_places(void)
     return n;
 }
 
+/* --- the sun's shadow maps, from the kept world (rt_sun_maps) --------------------------------------------
+ * Each scene's end, the world the ray tracing keeps - every kept mesh at each of its places (in view or
+ * not), what is placed anew each frame and the characters - is drawn from the sun into two depth maps:
+ * a near one round the camera (rt_near units) and a far one (rt_distance), each a sphere round its
+ * slice of the camera's view, its center snapped to whole texels (the edges hold still as the camera
+ * moves). Everything goes camera-relative, in double precision until it is small: the zone's
+ * coordinates run to thousands of units. Alpha-tested meshes let through what their test does. The
+ * world's own draws of the next frame look themselves up in them (the rt keys, gfx_msl.c). */
+enum { RT_MAP = 4096 };
+
+static const char SM_MSL[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct SmO { float4 pos [[position]]; float2 uv; };\n"
+    /* each vertex a position, a normal and texture coordinates (the capture's); w: the instance's object
+     * to the world less the camera's place; s: that to the map */
+    "vertex SmO sm_vs(uint vid [[vertex_id]], uint iid [[instance_id]], device const float4* v [[buffer(0)]],\n"
+    "                 device const float4x4* w [[buffer(1)]], constant float4x4& s [[buffer(2)]]) {\n"
+    "  SmO o;\n"
+    "  o.pos = s * (w[iid] * float4(v[3 * vid].xyz, 1.0));\n"
+    "  o.uv = v[3 * vid + 2].xy;\n"
+    "  return o;\n"
+    "}\n"
+    "fragment void sm_fs(SmO in [[stage_in]], texture2d<float> t [[texture(0)]], sampler sp [[sampler(0)]],\n"
+    "                    constant float& aref [[buffer(0)]]) {\n"
+    "  if (t.sample(sp, in.uv).a < aref) discard_fragment();\n"
+    "}\n";
+
+typedef struct SmCascade
+{
+    float m[16];         /* the world less the camera's place to the map: x, y -1..1, z 0..1 */
+    double texel, range; /* a texel in world units; world units over the map's depth */
+} SmCascade;
+
+static struct
+{
+    int tried, ok;
+    id<MTLRenderPipelineState> solid, alpha;
+    id<MTLTexture> map[2]; /* far, near */
+    SmCascade far, near;
+    int have_near;
+    double cam[3]; /* the camera the maps' matrices are relative to (their scene's) */
+    uint32_t drawn, instances; /* the profile: draws and instances of the last maps */
+} g_sm;
+
+static int sm_init(void)
+{
+    if (g_sm.tried)
+        return g_sm.ok || g_sm.solid;
+    g_sm.tried = 1;
+    id<MTLLibrary> lib = compile(SM_MSL);
+    if (!lib)
+        return 0;
+    id<MTLFunction> vf = [lib newFunctionWithName:@"sm_vs"], ff = [lib newFunctionWithName:@"sm_fs"];
+    MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = vf;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError* err = nil;
+    g_sm.solid = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    pd.fragmentFunction = ff;
+    g_sm.alpha = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release], [vf release], [ff release], [lib release];
+    for (int i = 0; i < 2; ++i)
+    {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                      width:RT_MAP height:RT_MAP mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        g_sm.map[i] = [g_dev newTextureWithDescriptor:td];
+    }
+    if (!g_sm.solid || !g_sm.alpha || !g_sm.map[0] || !g_sm.map[1])
+    {
+        fprintf(stderr, "[recomp] gfx: rt: shadow maps failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+        [g_sm.solid release], g_sm.solid = nil;
+        return 0;
+    }
+    return 1;
+}
+
+/* clip space (x, y, z) through clip-to-world vpinv to the world */
+static int rt_unproject(const double* vpinv, double x, double y, double z, double* o)
+{
+    double h[4];
+    for (int j = 0; j < 4; ++j)
+        h[j] = x * vpinv[j] + y * vpinv[4 + j] + z * vpinv[8 + j] + vpinv[12 + j];
+    if (fabs(h[3]) < 1e-12)
+        return 0;
+    for (int j = 0; j < 3; ++j)
+        o[j] = h[j] / h[3];
+    return 1;
+}
+
+static void v3_normalize(double* v)
+{
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0.0)
+        v[0] /= l, v[1] /= l, v[2] /= l;
+}
+
+/* a map over the slice [t0, t1] of the camera's view (units ahead of it): the sphere round the slice,
+ * seen along the sun (toward it: L), its center on whole texels; 200 units sunward of the sphere
+ * still cast into it (a cliff above the camera) */
+static int rt_cascade(const double* vpinv, const double* cam, const double* L, double t0, double t1, SmCascade* k)
+{
+    double c0[3], f[3], p[8][3], c[3] = { 0, 0, 0 };
+    if (!rt_unproject(vpinv, 0, 0, 0.5, c0))
+        return 0;
+    for (int j = 0; j < 3; ++j)
+        f[j] = c0[j] - cam[j];
+    v3_normalize(f);
+    for (int i = 0; i < 4; ++i)
+    {
+        double a[3], d[3];
+        if (!rt_unproject(vpinv, (i & 1) ? 1.0 : -1.0, (i & 2) ? 1.0 : -1.0, 0.5, a))
+            return 0;
+        for (int j = 0; j < 3; ++j)
+            d[j] = a[j] - cam[j];
+        v3_normalize(d);
+        double sc = 1.0 / fmax(d[0] * f[0] + d[1] * f[1] + d[2] * f[2], 1e-3);
+        for (int j = 0; j < 3; ++j)
+        {
+            p[i][j] = cam[j] + d[j] * t0 * sc, p[4 + i][j] = cam[j] + d[j] * t1 * sc;
+            c[j] += (p[i][j] + p[4 + i][j]) / 8.0;
+        }
+    }
+    double R = 0.0;
+    for (int i = 0; i < 8; ++i)
+    {
+        double dx = p[i][0] - c[0], dy = p[i][1] - c[1], dz = p[i][2] - c[2];
+        R = fmax(R, sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    R = ceil(R); /* whole units: the texel's size holds still */
+    double fl[3] = { -L[0], -L[1], -L[2] }, up[3] = { 0, 1, 0 };
+    if (fabs(fl[1]) > 0.9)
+        up[0] = 1, up[1] = 0;
+    double r[3] = { up[1] * fl[2] - up[2] * fl[1], up[2] * fl[0] - up[0] * fl[2], up[0] * fl[1] - up[1] * fl[0] };
+    v3_normalize(r);
+    double u[3] = { fl[1] * r[2] - fl[2] * r[1], fl[2] * r[0] - fl[0] * r[2], fl[0] * r[1] - fl[1] * r[0] };
+    double tx = 2.0 * R / RT_MAP;
+    double cx = floor((c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / tx) * tx;
+    double cy = floor((c[0] * u[0] + c[1] * u[1] + c[2] * u[2]) / tx) * tx;
+    double cz = c[0] * fl[0] + c[1] * fl[1] + c[2] * fl[2];
+    double back = 200.0, range = 2.0 * R + back, z0 = cz - R - back;
+    float m[16] = {
+        (float)(r[0] / R), (float)(u[0] / R), (float)(fl[0] / range), 0,
+        (float)(r[1] / R), (float)(u[1] / R), (float)(fl[1] / range), 0,
+        (float)(r[2] / R), (float)(u[2] / R), (float)(fl[2] / range), 0,
+        (float)(((cam[0] * r[0] + cam[1] * r[1] + cam[2] * r[2]) - cx) / R),
+        (float)(((cam[0] * u[0] + cam[1] * u[1] + cam[2] * u[2]) - cy) / R),
+        (float)(((cam[0] * fl[0] + cam[1] * fl[1] + cam[2] * fl[2]) - z0) / range), 1,
+    };
+    memcpy(k->m, m, sizeof m);
+    k->texel = tx, k->range = range;
+    return 1;
+}
+
+/* the kept world into one map */
+static void rt_map_draw(id<MTLTexture> target, const SmCascade* k, id<MTLBuffer> ib, NSUInteger ioff, uint32_t total,
+    id<MTLBuffer> dyn_buf, NSUInteger dyn_off, uint32_t dyn_verts)
+{
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = target;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+    [e setViewport:(MTLViewport){ 0, 0, RT_MAP, RT_MAP, 0, 1 }];
+    [e setDepthStencilState:g_fx.sdepth];
+    [e setCullMode:MTLCullModeNone];
+    [e setDepthBias:0 slopeScale:1.5f clamp:0];
+    [e setVertexBytes:k->m length:64 atIndex:2];
+    [e setVertexBuffer:ib offset:ioff atIndex:1];
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        [e setRenderPipelineState:pass ? g_sm.alpha : g_sm.solid];
+        for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        {
+            RtMesh* me = &g_rtx.mesh[i];
+            if (!me->sm_count || me->alpha != pass)
+                continue;
+            [e setVertexBuffer:me->rtv offset:0 atIndex:0];
+            if (pass)
+            {
+                GfxSampler sk = me->samp;
+                float aref = me->aref;
+                [e setFragmentTexture:me->tex atIndex:0];
+                [e setFragmentSamplerState:sampler(&sk) atIndex:0];
+                [e setFragmentBytes:&aref length:4 atIndex:0];
+            }
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:me->tris * 3 instanceCount:me->sm_count
+                 baseInstance:me->sm_first];
+            g_sm.drawn++;
+        }
+    }
+    if (dyn_verts) /* what moves: in the world already (the instance: less the camera's place alone) */
+    {
+        [e setRenderPipelineState:g_sm.solid];
+        [e setVertexBuffer:dyn_buf offset:dyn_off atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:dyn_verts instanceCount:1 baseInstance:total];
+        g_sm.drawn++;
+    }
+    [e endEncoding];
+}
+
+/* this scene's maps (vpinv: its camera, clip to the world); the draws of the next look themselves up */
+static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger dyn_off, uint32_t dyn_verts)
+{
+    g_sm.ok = 0;
+    if (!rt_inpass() || g_rtx.sun_now[3] <= 0.0f || g_rtx.k_now[0] <= 0.0f || !sm_init() || fabs(vpinv[11]) < 1e-12)
+        return;
+    double cam[3] = { vpinv[8] / vpinv[11], vpinv[9] / vpinv[11], vpinv[10] / vpinv[11] };
+    memcpy(g_sm.cam, cam, sizeof cam);
+    double L[3] = { g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2] };
+    v3_normalize(L);
+    double dfar = fmax(g_fxs.rt_distance, 4.0), dnear = fmin(fmax(g_fxs.rt_near, 0.0), dfar);
+    if (!rt_cascade(vpinv, cam, L, 0.5, dfar, &g_sm.far))
+        return;
+    g_sm.have_near = dnear >= 2.0 && dnear < dfar && rt_cascade(vpinv, cam, L, 0.5, dnear, &g_sm.near);
+    /* the instances, grouped by mesh: every place kept and every one placed this frame alone */
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        g_rtx.mesh[i].sm_count = 0;
+    for (uint32_t i = 0; i < g_rtx.nplace + g_rtx.nnow; ++i)
+    {
+        int kept = i < g_rtx.nplace;
+        RtMesh* me = &g_rtx.mesh[kept ? g_rtx.place[i].mesh : g_rtx.now[i - g_rtx.nplace].mesh];
+        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + RT_KEEP < g_serial)) || me->dead || !me->rtv || !me->tris)
+            continue;
+        me->sm_count++, total++;
+    }
+    uint32_t first = 0;
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        g_rtx.mesh[i].sm_first = first, first += g_rtx.mesh[i].sm_count, g_rtx.mesh[i].sm_count = 0;
+    id<MTLBuffer> ib;
+    NSUInteger ioff;
+    float* w = (float*)ring(((size_t)total + 1) * 64, 16, &ib, &ioff);
+    for (uint32_t i = 0; i < g_rtx.nplace + g_rtx.nnow; ++i)
+    {
+        int kept = i < g_rtx.nplace;
+        const float* pw = kept ? g_rtx.place[i].w : g_rtx.now[i - g_rtx.nplace].w;
+        RtMesh* me = &g_rtx.mesh[kept ? g_rtx.place[i].mesh : g_rtx.now[i - g_rtx.nplace].mesh];
+        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + RT_KEEP < g_serial)) || me->dead || !me->rtv || !me->tris)
+            continue;
+        float* o = w + 16 * (me->sm_first + me->sm_count++);
+        memcpy(o, pw, 64);
+        for (int j = 0; j < 3; ++j) /* less the camera's place */
+            o[12 + j] = (float)((double)pw[12 + j] - cam[j]);
+    }
+    float* dw = w + 16 * total; /* what moves: less the camera's place */
+    memset(dw, 0, 64);
+    dw[0] = dw[5] = dw[10] = dw[15] = 1.0f;
+    for (int j = 0; j < 3; ++j)
+        dw[12 + j] = (float)-cam[j];
+    g_sm.drawn = 0, g_sm.instances = total;
+    rt_map_draw(g_sm.map[0], &g_sm.far, ib, ioff, total, dyn_buf, dyn_off, dyn_verts);
+    if (g_sm.have_near)
+        rt_map_draw(g_sm.map[1], &g_sm.near, ib, ioff, total, dyn_buf, dyn_off, dyn_verts);
+    g_sm.ok = 1;
+}
+
 /* The structures for this frame's scene (camera: clip_world, its view to the world view_world); 0 when
  * there is nothing to trace. Each fixed caster places its mesh (object space to the world: its own
  * transform through the camera's inverse); a mesh new to it is captured in its own space (clip space
@@ -3692,7 +4027,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         uint32_t mi = rt_mesh(c); /* first: it may move the meshes */
         RtMesh* me = &g_rtx.mesh[mi];
         if (me->drawn != g_serial)
-            me->drawn = g_serial, me->ndrawn = 0;
+            me->drawn = g_serial, me->ndrawn = 0, me->order = i;
         me->ndrawn++;
         for (int j = 0; j < 16; ++j)
             me->wd[j] = wvp[j];
@@ -3741,6 +4076,18 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     for (int j = 0; j < 16; ++j)
         cwf[j] = (float)vpinv[j];
     clip_world = cwf;
+    /* the next frame's draws start from this camera, moved on as it moved from the one before
+     * (rt_frame_camera) */
+    {
+        double vpn[16];
+        if (have_vpinv && matd_inverse(vpn, vpinv))
+        {
+            g_rtx.have_vp_prev = g_rtx.have_vp_last && g_rtx.vp_last_serial + 1 == g_serial;
+            memcpy(g_rtx.vp_prev, g_rtx.vp_last, sizeof vpn);
+            memcpy(g_rtx.vp_last, vpn, sizeof vpn);
+            g_rtx.have_vp_last = 1, g_rtx.vp_last_serial = g_serial;
+        }
+    }
     if (have_vpinv && fabs(vpinv[11]) > 1e-12)
     {
         double cam3[3] = { vpinv[8] / vpinv[11], vpinv[9] / vpinv[11], vpinv[10] / vpinv[11] }, rel[16], vpr[16];
@@ -3880,21 +4227,64 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             njobs++;
         }
     /* anchors for the frames after: meshes drawn once this frame that hold still, where they stand now
-     * (in this frame's reference: the anchors' camera, or the scene's when no anchor was drawn) */
-    for (uint32_t i = 0; i < g_rtx.nmesh && g_rtx.nanchor < 8; ++i)
+     * (in this frame's reference: the anchors' camera, or the scene's when no anchor was drawn) - the
+     * ones drawn earliest first: the world's draws find the frame's camera by the first anchor drawn */
+    while (g_rtx.nanchor < 8)
     {
-        RtMesh* me = &g_rtx.mesh[i];
-        if (me->drawn != g_serial || me->ndrawn != 1 || me->unstable || !me->blas)
-            continue;
-        uint32_t a = 0;
-        for (; a < g_rtx.nanchor; ++a)
-            if (g_rtx.anchor[a].mesh == i)
-                break;
-        if (a < g_rtx.nanchor)
-            continue;
-        g_rtx.anchor[a].mesh = i, g_rtx.anchor[a].seen = g_serial;
+        uint32_t best = UINT32_MAX;
+        for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        {
+            RtMesh* me = &g_rtx.mesh[i];
+            if (me->drawn != g_serial || me->ndrawn != 1 || me->unstable || !me->blas ||
+                (best != UINT32_MAX && me->order >= g_rtx.mesh[best].order))
+                continue;
+            uint32_t a = 0;
+            for (; a < g_rtx.nanchor; ++a)
+                if (g_rtx.anchor[a].mesh == i)
+                    break;
+            if (a == g_rtx.nanchor)
+                best = i;
+        }
+        if (best == UINT32_MAX)
+            break;
+        RtMesh* me = &g_rtx.mesh[best];
+        uint32_t a = g_rtx.nanchor++;
+        g_rtx.anchor[a].mesh = best, g_rtx.anchor[a].seen = g_serial;
         memcpy(g_rtx.anchor[a].w, me->wd, sizeof me->wd);
-        g_rtx.nanchor++;
+        cache_key(&g_rtx.anchor[a].key, &me->c);
+    }
+    /* a full set drifts toward the meshes drawn first: the latest-drawn anchor gives way to an earlier
+     * candidate, one a frame (the fewer draws before the first anchor, the fewer on a camera guessed) */
+    if (anchored && g_rtx.nanchor == 8)
+    {
+        uint32_t late = UINT32_MAX, cand = UINT32_MAX;
+        for (uint32_t a = 0; a < g_rtx.nanchor; ++a)
+        {
+            RtMesh* me = &g_rtx.mesh[g_rtx.anchor[a].mesh];
+            if (me->drawn == g_serial && (late == UINT32_MAX || me->order > g_rtx.mesh[g_rtx.anchor[late].mesh].order))
+                late = a;
+        }
+        for (uint32_t i = 0; late != UINT32_MAX && i < g_rtx.nmesh; ++i)
+        {
+            RtMesh* me = &g_rtx.mesh[i];
+            if (me->drawn != g_serial || me->ndrawn != 1 || me->unstable || !me->blas ||
+                me->order >= g_rtx.mesh[g_rtx.anchor[late].mesh].order ||
+                (cand != UINT32_MAX && me->order >= g_rtx.mesh[cand].order))
+                continue;
+            uint32_t a = 0;
+            for (; a < g_rtx.nanchor; ++a)
+                if (g_rtx.anchor[a].mesh == i)
+                    break;
+            if (a == g_rtx.nanchor)
+                cand = i;
+        }
+        if (cand != UINT32_MAX)
+        {
+            RtMesh* me = &g_rtx.mesh[cand];
+            g_rtx.anchor[late].mesh = cand, g_rtx.anchor[late].seen = g_serial;
+            memcpy(g_rtx.anchor[late].w, me->wd, sizeof me->wd);
+            cache_key(&g_rtx.anchor[late].key, &me->c);
+        }
     }
     /* the triangles out */
     id<MTLBuffer> dyn_buf = nil;
@@ -3903,7 +4293,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     if (njobs)
     {
         if (dyn_verts)
-            ring((size_t)dyn_verts * 32, 16, &dyn_buf, &dyn_off);
+            ring((size_t)dyn_verts * 48, 16, &dyn_buf, &dyn_off);
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.renderTargetWidth = 1, rp.renderTargetHeight = 1, rp.defaultRasterSampleCount = 1;
         id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
@@ -3915,8 +4305,16 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             {
                 RtMesh* me = &g_rtx.mesh[j->mi];
                 /* shared: its box is read back once the GPU is done (rt_bounds) */
-                me->rtv = [g_dev newBufferWithLength:(NSUInteger)j->m * 32 options:MTLResourceStorageModeShared];
+                me->rtv = [g_dev newBufferWithLength:(NSUInteger)j->m * 48 options:MTLResourceStorageModeShared];
                 me->normals = j->c->lib.vs.el[GFX_R_NORMAL].used;
+                /* alpha-tested: its first texture and the test's reference, for the shadow maps */
+                [me->tex release], me->tex = nil, me->alpha = 0;
+                if (alpha_tested(&j->c->lib.fs) && j->c->tex[0])
+                {
+                    const GfxU* cu = (const GfxU*)((const uint8_t*)[j->c->ub contents] + j->c->uoff);
+                    me->tex = [j->c->tex[0] retain], me->samp = j->c->samp[0], me->alpha = 1;
+                    me->aref = fminf(fmaxf(cu->params[1] / 255.0f, 0.02f), 0.98f);
+                }
                 me->captured = g_serial, me->bounds = 0;
                 rt_capture(e, j->p, j->c, j->sm, j->ids, j->ids_off, j->m, me->rtv, 0);
                 jobs[nstatic++] = *j; /* the meshes first, in order (the moving ones are all in dyn_buf) */
@@ -3924,7 +4322,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             else
             {
                 rt_capture(e, j->p, j->c, j->sm, j->ids, j->ids_off, j->m, dyn_buf, at);
-                at += (NSUInteger)j->m * 32;
+                at += (NSUInteger)j->m * 48;
             }
         }
         [e endEncoding];
@@ -3996,6 +4394,8 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         else
             p->missed = 0;
     }
+    /* the sun's shadow maps from all of it (the world's draws of the next frame look themselves up) */
+    rt_sun_maps(vpinv, dyn_buf, dyn_off, dyn_verts);
     /* the instances: every place kept whose mesh has a structure, and what moves */
     NSMutableArray* list = [NSMutableArray arrayWithCapacity:g_rtx.nmesh + 1];
     g_rtx.nkept = g_rtx.kept_tris = 0;
@@ -4047,7 +4447,10 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             inst[n].transformationMatrix.columns[j].z = pw[4 * j + 2];
         }
         inst[n].options = MTLAccelerationStructureInstanceOptionOpaque;
-        inst[n].mask = 0xFF;
+        /* 1 the zone's (its shaders' draws); 2 the fixed function's (characters, and what they carry:
+         * they shade what stands around them, not themselves); 4 what is alpha-tested (leaves: traced
+         * solid, they would shade as squares) */
+        inst[n].mask = !me->c.lib.vs.prog ? 2 : alpha_tested(&me->c.lib.fs) ? 4 : 1;
         inst[n].accelerationStructureIndex = me->at;
         vtx[n] = me->rtv.gpuAddress | (uint64_t)(me->normals != 0); /* the low bit: with normals */
         g_rtx.kept_tris += me->tris;
@@ -4060,7 +4463,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
         inst[n].transformationMatrix.columns[1].y = 1.0f;
         inst[n].transformationMatrix.columns[2].z = 1.0f;
         inst[n].options = MTLAccelerationStructureInstanceOptionOpaque;
-        inst[n].mask = 0xFF;
+        inst[n].mask = 2; /* what moves */
         inst[n].accelerationStructureIndex = dyn_at;
         vtx[n] = dyn_buf.gpuAddress + dyn_off;
         [g_rtx.res addObject:dyn_buf];
@@ -4081,6 +4484,169 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     [sb release];
     g_rtx.blas = [list retain];
     return g_rtx.tlas != nil;
+}
+
+/* --- the world's draws shaded by the sun's shadow maps, as they are drawn ---------------------------------
+ * The world's opaque draws (GfxDraw.caster) get a traced pipeline (the rt keys, gfx_msl.c): the vertex
+ * function passes on each vertex's place in the world, less the camera's; the fragment function looks
+ * that place up in the sun's shadow maps of the last scene (rt_sun_maps) and takes a share of its colour
+ * where something nearer the sun is there - before the game's fog, so the fog lies over the shadow as it
+ * would over the lit ground. What the draws need to find their place in the world is the camera they
+ * were drawn with: a fixed-function draw's own view and projection; for the zone's shaders (their
+ * transforms carry no camera of their own), the frame's camera - the last frame's, moved on as it moved,
+ * until the first anchor is drawn, then that anchor's (its transform through the inverse of where it
+ * stands). */
+typedef struct RtDraw
+{
+    float m[16];  /* clip space to the world less the camera's place */
+    float cam[4]; /* the camera's place */
+    float sun[4]; /* toward the sun; w = 1 when there is one */
+    float k[4];   /* the shadow's strength, -, how far out, the far map's filter step (its uv) */
+    float sn[16], sf[16]; /* the world less the camera's place to the near and far maps */
+    float c[4];   /* the near map's normal offset (world units), -, the far one's, the near filter step */
+    float bz[4];  /* the near and far maps' depth biases, 1 when there is a near map */
+} RtDraw;
+
+static int rt_inpass(void)
+{
+    return g_rtx.ok && g_fxs.fx != 0.0f && g_fxs.rt > 0.0f && g_fxs.rt_shadow > 0.0f;
+}
+
+static int rt_draw_wanted(const GfxDraw* d)
+{
+    return (d->caster == 1 || d->caster == 2) && !d->vs.rhw && !g_rt_face && !g_rt_level && g_sm.ok && rt_inpass();
+}
+
+/* clip space back to the world less the camera's place (m) and that place (cam), from world to clip */
+static int rt_ray_camera(const double* vp, float* m, float* cam)
+{
+    double inv[16], vpr[16], rel[16];
+    if (!matd_inverse(inv, vp) || fabs(inv[11]) < 1e-12)
+        return 0;
+    double c[3] = { inv[8] / inv[11], inv[9] / inv[11], inv[10] / inv[11] };
+    memcpy(vpr, vp, sizeof vpr);
+    for (int j = 0; j < 4; ++j)
+        vpr[12 + j] = c[0] * vp[j] + c[1] * vp[4 + j] + c[2] * vp[8 + j] + vp[12 + j];
+    if (!matd_inverse(rel, vpr))
+        return 0;
+    for (int j = 0; j < 16; ++j)
+        m[j] = (float)rel[j];
+    for (int k = 0; k < 3; ++k)
+        cam[k] = (float)c[k];
+    return 1;
+}
+
+/* the mesh a draw is (its CacheKey), as its recorded caster's would be; 0 when it is not one the game
+ * keeps */
+static int rt_draw_key(const GfxDraw* d, CacheKey* k)
+{
+    if (d->prim == GFX_TRIANGLEFAN || (d->indices && !d->ibuf))
+        return 0;
+    memset(k, 0, sizeof *k);
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+    {
+        if (d->buf[s])
+            k->vb[s] = (void*)d->buf[s]->b, k->voff[s] = d->buf_off[s];
+        else if (d->data[s] && d->size[s])
+            return 0;
+        else
+            k->vb[s] = (void*)g_dummy;
+    }
+    if (d->ibuf)
+        k->ib = (void*)d->ibuf->b, k->ioff = d->ibuf_off;
+    k->n = vertex_count(d->prim, d->count), k->vstart = d->vertex_start;
+    k->lib.vs = d->vs, k->lib.fs = d->fs;
+    return 1;
+}
+
+/* the frame's camera for a zone's draw, as far as the draws so far give it (rd.m, rd.cam) */
+static int rt_frame_camera(const GfxDraw* d, RtDraw* rd)
+{
+    if (g_rtx.fvp_serial != g_serial)
+    {
+        g_rtx.fvp_serial = g_serial, g_rtx.fvp_exact = 0;
+        /* the last camera, moved on by as much as it moved the frame before: last * (before^-1 * last)
+         * in D3D's order (world to clip: the step is a move of the world, then the camera) */
+        double guess[16], ib[16], step[16];
+        memcpy(guess, g_rtx.vp_last, sizeof guess);
+        if (g_rtx.have_vp_prev && g_rtx.vp_last_serial + 1 == g_serial && matd_inverse(ib, g_rtx.vp_prev))
+            matd_mul(step, g_rtx.vp_last, ib), matd_mul(guess, step, g_rtx.vp_last);
+        g_rtx.fvp_ok = g_rtx.have_vp_last && rt_ray_camera(guess, g_rtx.fvp_m, g_rtx.fvp_cam);
+    }
+    CacheKey k;
+    float wvp[16];
+    if (!g_rtx.fvp_exact && g_rtx.nanchor && rt_draw_key(d, &k))
+        for (uint32_t a = 0; a < g_rtx.nanchor; ++a)
+        {
+            if (memcmp(&k, &g_rtx.anchor[a].key, sizeof k))
+                continue;
+            double iw[16], wd[16], vp[16];
+            if (rt_wvp_u(&d->u, &d->vs, d->vs_tokens, wvp) && matd_inverse(iw, g_rtx.anchor[a].w))
+            {
+                for (int j = 0; j < 16; ++j)
+                    wd[j] = wvp[j];
+                matd_mul(vp, iw, wd);
+                if (rt_ray_camera(vp, g_rtx.fvp_m, g_rtx.fvp_cam))
+                    g_rtx.fvp_ok = 1, g_rtx.fvp_exact = 1;
+            }
+            break;
+        }
+    if (!g_rtx.fvp_ok)
+        return 0;
+    memcpy(rd->m, g_rtx.fvp_m, 64);
+    memcpy(rd->cam, g_rtx.fvp_cam, 12);
+    return 1;
+}
+
+/* a traced draw's camera, the sun and the maps, into the encoder */
+static void rt_draw_bind(const GfxDraw* d, id<MTLRenderCommandEncoder> e)
+{
+    RtDraw rd;
+    memset(&rd, 0, sizeof rd);
+    int ok;
+    if (!d->vs.prog)
+    {
+        double vp[16];
+        for (int j = 0; j < 16; ++j)
+            vp[j] = d->view_proj[j];
+        ok = rt_ray_camera(vp, rd.m, rd.cam);
+        g_rtx.dr_ffp += ok;
+    }
+    else
+    {
+        ok = rt_frame_camera(d, &rd);
+        if (ok)
+            g_rtx.fvp_exact ? g_rtx.dr_exact++ : g_rtx.dr_pred++;
+    }
+    if (ok)
+    {
+        memcpy(rd.sun, g_rtx.sun_now, 16);
+        rd.k[0] = g_rtx.k_now[0], rd.k[2] = g_rtx.k_now[2], rd.k[3] = 1.0f / RT_MAP;
+        const SmCascade* n = g_sm.have_near ? &g_sm.near : &g_sm.far;
+        memcpy(rd.sn, n->m, 64), memcpy(rd.sf, g_sm.far.m, 64);
+        /* the maps are relative to their scene's camera, the draw's place to its own: moved by the
+         * difference (else every shadow slides by the camera's step between them) */
+        float dc[3];
+        for (int i = 0; i < 3; ++i)
+            dc[i] = (float)((double)rd.cam[i] - g_sm.cam[i]);
+        for (int j = 0; j < 3; ++j)
+        {
+            rd.sn[12 + j] += dc[0] * rd.sn[j] + dc[1] * rd.sn[4 + j] + dc[2] * rd.sn[8 + j];
+            rd.sf[12 + j] += dc[0] * rd.sf[j] + dc[1] * rd.sf[4 + j] + dc[2] * rd.sf[8 + j];
+        }
+        rd.c[0] = (float)(1.5 * n->texel), rd.c[2] = (float)(1.5 * g_sm.far.texel), rd.c[3] = 1.0f / RT_MAP;
+        rd.bz[0] = (float)(0.5 * n->texel / n->range), rd.bz[1] = (float)(0.5 * g_sm.far.texel / g_sm.far.range);
+        rd.bz[2] = g_sm.have_near ? 1.0f : 0.0f;
+    }
+    else
+    {
+        g_rtx.dr_none++;
+        rd.m[0] = rd.m[5] = rd.m[10] = rd.m[15] = 1.0f; /* no camera: no shadow (sun.w 0) */
+    }
+    [e setVertexBytes:&rd length:sizeof rd atIndex:5];
+    [e setFragmentBytes:&rd length:sizeof rd atIndex:5];
+    [e setFragmentTexture:g_sm.map[g_sm.have_near ? 1 : 0] atIndex:8];
+    [e setFragmentTexture:g_sm.map[0] atIndex:9];
 }
 
 /* the traced scene against the drawn one (debug = 6), at w x h */
@@ -4221,7 +4787,8 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 g_fx.sunw_seen = g_serial;
                 fx_ease(g_fx.suncol, s->sun_color, 3, 0.1f);
             }
-            int shadows = g_fxs.sun > 0.0f || g_fxs.shadow > 0.0f;
+            int shadows = g_fxs.sun > 0.0f || g_fxs.shadow > 0.0f || rt_inpass();
+            g_rtx.day = 0.0f;
             if (have_v && (own || (shadows && g_fx.sunw_seen && g_fx.sunw_seen + 600 > g_serial)))
             {
                 /* back into this frame's view */
@@ -4244,9 +4811,12 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     g_fx.tr_dl = dl, g_fx.tr_al = al;
                 }
                 day *= g_fxs.sun_direct > 0.0f ? g_fx.direct : 1.0f;
-                u.shadow[0] = g_fxs.shadow * day;
+                g_rtx.day = day;
+                /* the world's draws traced (rt_draw_bind) shade themselves: not again from the sun's
+                 * maps and the contact rays */
+                u.shadow[0] = rt_inpass() ? 0.0f : g_fxs.shadow * day;
                 u.shadow[1] = g_fxs.shadow_length, u.shadow[2] = 0.3f, u.shadow[3] = 40.0f;
-                if (g_fxs.sun > 0.0f && day > 0.0f && sun_map(s, g_fx.sunw, &u))
+                if (g_fxs.sun > 0.0f && day > 0.0f && !rt_inpass() && sun_map(s, g_fx.sunw, &u))
                     u.smap[0] = g_fxs.sun * day, g_fx.st_drawn_this = 1;
                 g_fx.tr_strength = u.smap[0], g_fx.tr_day = day;
                 u.smap2[1] = fminf(fmaxf(g_fxs.sun_face, 0.0f), 1.0f), u.smap2[2] = fmaxf(g_fxs.sun_min, 0.0f);
@@ -4292,9 +4862,6 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
             {
                 float invP[16], cw[16];
                 memcpy(u.vw, vinv, 64);
-                if (mat_inverse(invP, s->proj))
-                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj);
-                memcpy(u.ivp, g_rtx.ray_ivp, 64), memcpy(u.cam, g_rtx.ray_cam, 12);
                 /* the sun as the effects keep it: in the world, the last a lit draw gave */
                 memcpy(u.sunw, g_fx.sunw, 12), u.sunw[3] = u.sun[3];
                 if (g_fxs.rt_sun_elev != 0.0f)
@@ -4303,6 +4870,15 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     float el = g_fxs.rt_sun_elev * (float)M_PI / 180.0f, az = g_fxs.rt_sun_azim * (float)M_PI / 180.0f;
                     u.sunw[0] = cosf(el) * cosf(az), u.sunw[1] = -sinf(el), u.sunw[2] = cosf(el) * sinf(az), u.sunw[3] = 1.0f;
                 }
+                /* for the maps and the world's draws until the next scene: the sun, and the shadow's
+                 * strength by day (the tester's sun at full) */
+                memcpy(g_rtx.sun_now, u.sunw, 16);
+                float strength = g_fxs.rt_shadow * (g_fxs.rt_sun_elev != 0.0f ? 1.0f : g_rtx.day);
+                g_rtx.sun_now[3] = strength > 0.0f ? g_rtx.sun_now[3] : 0.0f;
+                g_rtx.k_now[0] = strength, g_rtx.k_now[2] = fmaxf(g_fxs.rt_distance, 1.0f);
+                if (mat_inverse(invP, s->proj))
+                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj);
+                memcpy(u.ivp, g_rtx.ray_ivp, 64), memcpy(u.cam, g_rtx.ray_cam, 12);
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
             u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
@@ -4389,6 +4965,14 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                         "after the effects, 2 s), %u built this frame, %u waiting\n", g_rtx.nkept, g_rtx.ninst, g_rtx.kept_tris,
                         g_rtx.moving_tris, g_rtx.late_used, g_rtx.built, g_rtx.waiting),
                     g_rtx.late_used = 0;
+                if (rt_inpass())
+                    fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
+                        "last frame's, %u fixed-function, %u with none; sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
+                        "instances, %u draws, texels %.3f / %.3f units\n", g_rtx.dr_exact,
+                        g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
+                        g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
+                        g_sm.drawn, g_sm.have_near ? g_sm.near.texel : 0.0, g_sm.far.texel),
+                    g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: camera from anchors %u frames (%.1f agreeing, spread at most %.5f units), the "
                         "scene's %u; %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,

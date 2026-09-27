@@ -101,6 +101,8 @@ typedef struct GfxVsKey
     uint8_t capture;    /* run once more with nothing drawn (the back end's ray tracing): the vertex
                          * ids come from the list in buffer 7, and the position the function makes,
                          * through the matrix in buffer 5, goes to buffer 6 at the list's place */
+    uint8_t rt;         /* traced (the back end's ray tracing): the function passes on its place in the
+                         * world, less the camera's (the clip space through RtDraw.m, buffer 5) */
 } GfxVsKey;
 
 typedef struct GfxStage
@@ -120,7 +122,9 @@ typedef struct GfxFsKey
     uint8_t fog;        /* D3DFOGMODE: pixel (table) fog; 4 = the vertex function's fog factor */
     uint8_t specular_add;
     uint8_t flat;
-    uint8_t pad[3];
+    uint8_t rt;   /* traced (the back end's ray tracing): shaded where a ray toward the sun hits the
+                   * scene's triangles (buffer 6), before the fog */
+    uint8_t pad[2];
 } GfxFsKey;
 
 /* The render pipeline beyond the functions: blending and the color write mask. */
@@ -197,6 +201,8 @@ typedef struct GfxDraw
     int32_t zbias;  /* D3DRS_ZBIAS */
     uint32_t stencil_ref;
     uint32_t vp[6]; /* D3DVIEWPORT8 (MinZ, MaxZ as float bits) */
+    float view_proj[16]; /* D3DTS_VIEW * D3DTS_PROJECTION as they are at the draw: the fixed function's
+                          * clip space back to the world (the back end's ray tracing) */
     /* vertices: stream s holds vertex (first + i) at data[s] + i * stride - copied per draw - or,
      * for a static buffer, at buf_off[s] + i * stride in buf[s] */
     const void* data[GFX_NSTREAMS];

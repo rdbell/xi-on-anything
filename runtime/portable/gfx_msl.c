@@ -87,6 +87,8 @@ static void emit_vout(Sb* b, const GfxVsKey* k)
             point_per_vertex(k) ? "  float4 pa [[user(pa)]];\n  float4 pd [[user(pd)]];\n  float4 ps [[user(ps)]];\n" : "");
     for (int i = 0; i < ntex; ++i)
         sb_printf(b, "  float4 t%d [[user(t%d)]];\n", i, i);
+    if (k->rt)
+        sb_printf(b, "  float3 wp [[user(wp)]];\n");
     sb_printf(b, "  float fog [[user(fog)]];\n  float ez [[user(ez)]];\n  float psize [[point_size]];\n};\n");
 }
 
@@ -137,8 +139,9 @@ static int elem_components(uint8_t type)
 /* drawn from the sun: whatever clip-space position the function makes (the camera's, from the
  * transforms or a vertex shader's constants) goes on through the camera's inverse into the sun's
  * view - one matrix, so any draw of the scene can be drawn again into the shadow map. Captured (ray
- * tracing): the same matrix takes it to the world, and it is written out with the vertex's normal,
- * one pair per entry of the list of vertex ids - a draw's triangles, three vertices each. */
+ * tracing): the same matrix takes it to the world, and it is written out with the vertex's normal and
+ * first texture coordinates, three float4 per entry of the list of vertex ids - a draw's triangles,
+ * three vertices each. */
 void gfx_msl_vs_open(Sb* b, const GfxVsKey* k)
 {
     sb_printf(b, "vertex %s vs_main(uint %s [[vertex_id]], constant U& u [[buffer(4)]]", k->capture ? "void" : "VOut",
@@ -149,6 +152,8 @@ void gfx_msl_vs_open(Sb* b, const GfxVsKey* k)
         sb_printf(b, ", constant float4x4& sm [[buffer(5)]]");
     if (k->capture)
         sb_printf(b, ", device float4* cap [[buffer(6)]], device const uint* cidx [[buffer(7)]]");
+    if (k->rt)
+        sb_printf(b, ", constant RtDraw& rd [[buffer(5)]]");
     sb_printf(b, ") {\n  VOut o;\n");
     if (k->capture)
         sb_printf(b, "  uint vid = cidx[cid];\n");
@@ -161,13 +166,17 @@ void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
         /* without D3D's pixel-center fixup (emit_fixup): a fraction of a pixel of the camera the draw
          * was captured with, which through sm would part neighbouring meshes captured apart */
         sb_printf(b, "  o.pos.x -= o.pos.w / u.vp.z;\n  o.pos.y += o.pos.w / u.vp.w;\n"
-                     "  float4 w = sm * o.pos;\n  cap[2 * cid] = float4(w.xyz / w.w, 1.0);\n");
-        /* and the vertex's own normal beside it (in its object's space), for smooth shading */
-        sb_printf(b, "  cap[2 * cid + 1] = %s;\n  return;\n}\n", k->el[GFX_R_NORMAL].used ? "float4(v3.xyz, 0.0)" : "float4(0.0)");
+                     "  float4 w = sm * o.pos;\n  cap[3 * cid] = float4(w.xyz / w.w, 1.0);\n");
+        /* and beside it the vertex's own normal (in its object's space: smooth shading) and its first
+         * texture coordinates (an alpha-tested mesh's texture, for what it lets through) */
+        sb_printf(b, "  cap[3 * cid + 1] = %s;\n  cap[3 * cid + 2] = %s;\n  return;\n}\n",
+            k->el[GFX_R_NORMAL].used ? "float4(v3.xyz, 0.0)" : "float4(0.0)", k->ntex ? "float4(o.t0.xy, 0.0, 0.0)" : "float4(0.0)");
         return;
     }
     if (k->shadow)
         sb_printf(b, "  o.pos = sm * o.pos;\n");
+    if (k->rt) /* its place in the world, less the camera's: clip space back through the draw's camera */
+        sb_printf(b, "  { float4 wr = rd.m * o.pos; o.wp = wr.xyz / wr.w; }\n");
     sb_printf(b, "  return o;\n}\n");
 }
 
@@ -419,6 +428,8 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 {
     int pix = pixel_lit(vk);
     sb_printf(b, "fragment float4 fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", pix ? "vin" : "in");
+    if (k->rt)
+        sb_printf(b, ", constant RtDraw& rd [[buffer(5)]], depth2d<float> rt_smn [[texture(8)]], depth2d<float> rt_smf [[texture(9)]]");
     for (int i = 0; i < 8; ++i)
     {
         int t = k->prog || i < k->nstages ? k->st[i].tex : 0;
@@ -438,8 +449,50 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
     }
 }
 
+/* Traced (rt): the sun's shadow, from the back end's two maps of the world seen from the sun (the near
+ * one where it covers the place, else the far one): the colour loses rd.k.x of itself where the map
+ * holds something nearer the sun - on faces toward it, fading in over their first few degrees and out
+ * toward rd.k.z units away. The face's normal is the place's own slope across the pixel (the zone's
+ * shaders pass no normal on); the place is looked up a little off the face along it (rd.c.x, c.z: a
+ * texel and a half), through nine samples a texel apart (rd.c.w, k.w). */
+static void emit_rt_shadow(Sb* b)
+{
+    sb_printf(b,
+        "  float rt_vis = 1.0, rt_w = 0.0;\n"
+        "  {\n"
+        "    float nn = dot(rt_n, rt_n), dist = length(in.wp);\n"
+        "    if (rd.sun.w > 0.0 && nn > 1e-20 && dist < rd.k.z) {\n"
+        "      float3 n = rt_n * rsqrt(nn);\n"
+        "      if (dot(n, in.wp) > 0.0) n = -n;\n"
+        "      float nl = dot(n, rd.sun.xyz);\n"
+        "      rt_w = smoothstep(0.0, 0.2, nl) * (1.0 - smoothstep(0.8 * rd.k.z, rd.k.z, dist));\n"
+        "      if (nl > 0.0) {\n"
+        "        constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
+        "        float4 q = rd.sn * float4(in.wp + n * rd.c.x, 1.0);\n"
+        "        bool nr = rd.bz.z > 0.0 && all(abs(q.xy) < 0.97) && q.z > 0.0 && q.z < 1.0;\n"
+        "        float step = rd.c.w, bias = rd.bz.x;\n"
+        "        if (!nr) q = rd.sf * float4(in.wp + n * rd.c.z, 1.0), step = rd.k.w, bias = rd.bz.y;\n"
+        "        if (all(abs(q.xy) < 1.0) && q.z > 0.0 && q.z < 1.0) {\n"
+        "          float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+        "          float s = 0.0, z = q.z - bias;\n"
+        "          for (int j = -1; j <= 1; ++j)\n"
+        "            for (int i = -1; i <= 1; ++i)\n"
+        "              s += nr ? rt_smn.sample_compare(cmp, uv + float2(i, j) * step, z)\n"
+        "                      : rt_smf.sample_compare(cmp, uv + float2(i, j) * step, z);\n"
+        "          rt_vis = s / 9.0;\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n");
+}
+
 static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
 {
+    if (k->rt)
+    {
+        sb_printf(b, "  float3 rt_n = cross(dfdx(in.wp), dfdy(in.wp));\n");
+        emit_rt_shadow(b);
+    }
     if (k->alpha_func && k->alpha_func != 8)
     {
         static const char* const cmp[] = { "", "false", "<", "==", "<=", ">", "!=", ">=", "true" };
@@ -448,6 +501,8 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
         else if (k->alpha_func < 8)
             sb_printf(b, "  if (!(rint(saturate(%s.a) * 255.0) %s u.params.y)) discard_fragment();\n", col, cmp[k->alpha_func]);
     }
+    if (k->rt)
+        sb_printf(b, "  %s.rgb *= 1.0 - rd.k.x * rt_w * (1.0 - rt_vis);\n", col);
     if (k->fog)
     {
         if (k->fog == 4)
@@ -514,6 +569,13 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
 {
     Sb b = { 0 };
     sb_printf(&b, "%s", PRELUDE);
+    /* traced: what the back end gives each draw (buffer 5, RtDraw in gfx_metal.m): clip space to the
+     * world less the camera's place, the camera's place, toward the sun (w: 1 when there is one), the
+     * shadow's strength and how far out it reaches (k.x, k.z), and the sun's two shadow maps (near and
+     * far: the world less the camera's place to the map, the normal offsets, filter steps and depth
+     * biases) */
+    if (vk->rt || fk->rt)
+        sb_printf(&b, "struct RtDraw { float4x4 m; float4 cam; float4 sun; float4 k; float4x4 sn, sf; float4 c; float4 bz; };\n");
     emit_vout(&b, vk);
     if (vk->prog)
     {
