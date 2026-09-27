@@ -137,8 +137,8 @@ static int elem_components(uint8_t type)
 /* drawn from the sun: whatever clip-space position the function makes (the camera's, from the
  * transforms or a vertex shader's constants) goes on through the camera's inverse into the sun's
  * view - one matrix, so any draw of the scene can be drawn again into the shadow map. Captured (ray
- * tracing): the same matrix takes it to the world, and it is written out, one per entry of the list
- * of vertex ids - a draw's triangles, three vertices each. */
+ * tracing): the same matrix takes it to the world, and it is written out with the vertex's normal,
+ * one pair per entry of the list of vertex ids - a draw's triangles, three vertices each. */
 void gfx_msl_vs_open(Sb* b, const GfxVsKey* k)
 {
     sb_printf(b, "vertex %s vs_main(uint %s [[vertex_id]], constant U& u [[buffer(4)]]", k->capture ? "void" : "VOut",
@@ -158,7 +158,12 @@ void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
 {
     if (k->capture)
     {
-        sb_printf(b, "  float4 w = sm * o.pos;\n  cap[cid] = float4(w.xyz / w.w, 1.0);\n  return;\n}\n");
+        /* without D3D's pixel-center fixup (emit_fixup): a fraction of a pixel of the camera the draw
+         * was captured with, which through sm would part neighbouring meshes captured apart */
+        sb_printf(b, "  o.pos.x -= o.pos.w / u.vp.z;\n  o.pos.y += o.pos.w / u.vp.w;\n"
+                     "  float4 w = sm * o.pos;\n  cap[2 * cid] = float4(w.xyz / w.w, 1.0);\n");
+        /* and the vertex's own normal beside it (in its object's space), for smooth shading */
+        sb_printf(b, "  cap[2 * cid + 1] = %s;\n  return;\n}\n", k->el[GFX_R_NORMAL].used ? "float4(v3.xyz, 0.0)" : "float4(0.0)");
         return;
     }
     if (k->shadow)
