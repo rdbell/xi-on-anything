@@ -2814,8 +2814,11 @@ static int sun_map(const GfxScene* s, const float* L, FxU* u)
  * its own space, into a structure of its own. Each place it is drawn - that matrix through the camera's
  * inverse, object to world - is an instance of it, kept for RT_KEEP frames after it was last drawn: the
  * game draws only what the camera sees, and the zone behind the camera still casts. A zone's meshes are
- * drawn many times each (rocks, trees, tiles of ground), and a door is one place that moves. The rest
- * (characters, drawn from the frame's ring) is captured in the world every frame, into one structure.
+ * drawn many times each (rocks, trees, tiles of ground), and a door is one place that moves. A place the
+ * camera looks straight at that is no longer drawn is dropped (the game drew a nearer or farther detail
+ * of the mesh instead); a mesh whose places move on most frames (grass swaying) is placed anew each frame
+ * and kept nowhere. The rest (characters, drawn from the frame's ring) is captured in the world every
+ * frame, into one structure.
  * The instance structure over all of it is built every frame.
  *
  * debug = 6 shows the traced scene against the drawn one: the mesh a ray hits, in a tint of its own,
@@ -2871,6 +2874,10 @@ typedef struct RtMesh
     int dead; /* a buffer it draws from changed or went: captured again when drawn again */
     int none; /* no triangles to trace (lines, points) */
     uint32_t at; /* its index among this frame's instance structures */
+    /* its draws since the last look (rt_trim): on a place kept as it was, or not (moved, new); unstable:
+     * most were not - it moves every frame (swaying, animated), placed anew each frame and kept nowhere */
+    uint32_t n_same, n_move;
+    int unstable;
 } RtMesh;
 
 /* one place a mesh is drawn: its object space to the world (row vectors, as D3D) */
@@ -2880,6 +2887,8 @@ typedef struct RtPlace
     float w[16];
     uint64_t seen;
     int32_t next; /* the next in its hash cell (rt_hash), -1 */
+    uint8_t missed; /* frames traced since, in the camera's view but not drawn */
+    uint8_t gone;   /* not drawn where the camera sees it: replaced (a nearer or farther detail of it), dropped */
 } RtPlace;
 
 static struct
@@ -2907,6 +2916,11 @@ static struct
     uint32_t nkept, kept_tris, ninst, moving_tris, built, waiting;
     uint32_t pl_same, pl_moved, pl_new, pl_samefr; /* places matched as kept, moved, new; new beside one drawn this frame */
     float pl_nd, pl_nt; /* a new place's nearest kept one: largest rotation difference, translation distance */
+    /* this frame's places of the unstable meshes: mesh, object to world */
+    struct { uint32_t mesh; float w[16]; } *now;
+    uint32_t nnow, cap_now;
+    uint32_t pl_gone; /* places dropped: in view, not drawn */
+    uint32_t pl_far, pl_full; /* draws not placed: out of the world (far off, not finite), their mesh at RT_PLACES */
 } g_rtx;
 
 /* released once the GPU is past everything recorded so far (a structure an instance structure in flight
@@ -3074,7 +3088,12 @@ static MTLPrimitiveAccelerationStructureDescriptor* rt_blas_desc(id<MTLBuffer> v
     return d;
 }
 
-enum { RT_KEEP = 60 * 30 }; /* frames a place is kept after it was last drawn */
+enum
+{
+    RT_KEEP = 60 * 30,  /* frames a place is kept after it was last drawn */
+    RT_PLACES = 4096,   /* places one mesh may have */
+    RT_WORLD = 100000,  /* how far from the origin a place may be, in world units */
+};
 
 static void rt_map_free(void)
 {
@@ -3112,13 +3131,44 @@ static void rt_forget(id<MTLBuffer> buf)
 static void rt_trim(int all)
 {
     uint32_t* remap = (uint32_t*)malloc((g_rtx.nmesh + 1) * sizeof *remap);
+    /* which meshes hold still: most of their draws since the last look on a place kept as it was */
+    uint32_t top[5] = { 0 }, ntop = 0;
     for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
-        g_rtx.mesh[i].nplace = 0;
+    {
+        RtMesh* me = &g_rtx.mesh[i];
+        if (me->n_move + me->n_same >= 32)
+            me->unstable = me->n_move > me->n_same;
+        if (gfx_profiling && me->n_move)
+        {
+            uint32_t k = ntop < 5 ? ntop++ : 4;
+            if (k == 4 && ntop == 5 && g_rtx.mesh[top[4]].n_move >= me->n_move)
+                continue;
+            top[k] = i;
+            for (; k > 0 && g_rtx.mesh[top[k - 1]].n_move < g_rtx.mesh[top[k]].n_move; --k)
+            {
+                uint32_t t = top[k];
+                top[k] = top[k - 1], top[k - 1] = t;
+            }
+        }
+    }
+    if (gfx_profiling && ntop && !all)
+    {
+        fprintf(stderr, "[recomp] gfx: rt: the meshes placed anew most (draws kept as they were / not, places, triangles, shader):");
+        for (uint32_t k = 0; k < ntop; ++k)
+        {
+            RtMesh* me = &g_rtx.mesh[top[k]];
+            fprintf(stderr, " %u/%u %u %u %08x%s;", me->n_same, me->n_move, me->nplace, me->tris, me->c.lib.vs.prog,
+                me->unstable ? " unstable" : "");
+        }
+        fprintf(stderr, "\n");
+    }
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        g_rtx.mesh[i].nplace = 0, g_rtx.mesh[i].n_move = g_rtx.mesh[i].n_same = 0;
     uint32_t np = 0;
     for (uint32_t i = 0; i < g_rtx.nplace; ++i)
     {
         RtPlace* p = &g_rtx.place[i];
-        if (!all && p->seen + RT_KEEP >= g_serial)
+        if (!all && !p->gone && p->seen + RT_KEEP >= g_serial && !g_rtx.mesh[p->mesh].unstable)
             g_rtx.place[np++] = *p, g_rtx.mesh[p->mesh].nplace++;
     }
     g_rtx.nplace = np;
@@ -3187,6 +3237,8 @@ static int rt_wvp(const Caster* c, float* out)
     return 1;
 }
 
+static int rt_unit(float v) { return (int)floorf(fminf(fmaxf(v, -(float)RT_WORLD), (float)RT_WORLD)); }
+
 static uint32_t rt_cell(uint32_t m, int x, int y, int z)
 {
     uint32_t h = m * 0x9E3779B1u ^ (uint32_t)x * 0x85EBCA77u ^ (uint32_t)y * 0xC2B2AE3Du ^ (uint32_t)z * 0x27D4EB2Fu;
@@ -3196,7 +3248,7 @@ static uint32_t rt_cell(uint32_t m, int x, int y, int z)
 static void rt_hash_add(uint32_t i)
 {
     RtPlace* p = &g_rtx.place[i];
-    uint32_t c = rt_cell(p->mesh, (int)floorf(p->w[12]), (int)floorf(p->w[13]), (int)floorf(p->w[14]));
+    uint32_t c = rt_cell(p->mesh, rt_unit(p->w[12]), rt_unit(p->w[13]), rt_unit(p->w[14]));
     p->next = g_rtx.head[c], g_rtx.head[c] = (int32_t)i;
 }
 
@@ -3215,12 +3267,12 @@ static void rt_hash(void)
 
 /* where this frame's draw of mesh m (object to world w) is: a place already kept there, one drawn the
  * frame traced before that has since moved a little (a door opening), or a new one */
-static void rt_place(uint32_t m, const float* w)
+static int32_t rt_place(uint32_t m, const float* w)
 {
     RtMesh* me = &g_rtx.mesh[m];
     int moved = -1;
     float best = 0.25f, nd = 1e9f, nt = 1e9f;
-    int cx = (int)floorf(w[12]), cy = (int)floorf(w[13]), cz = (int)floorf(w[14]);
+    int cx = rt_unit(w[12]), cy = rt_unit(w[13]), cz = rt_unit(w[14]);
     for (int k = 0; k < 27; ++k)
     {
         int x = cx + k % 3 - 1, y = cy + (k / 3) % 3 - 1, z = cz + k / 9 - 1;
@@ -3228,7 +3280,7 @@ static void rt_place(uint32_t m, const float* w)
         for (int32_t i = g_rtx.head[c]; i >= 0; i = g_rtx.place[i].next)
         {
             RtPlace* p = &g_rtx.place[i];
-            if (p->mesh != m)
+            if (p->mesh != m || p->gone)
                 continue;
             float d = 0.0f;
             for (int j = 0; j < 12; ++j)
@@ -3243,7 +3295,7 @@ static void rt_place(uint32_t m, const float* w)
                 if (d < 1e-2f && t < 0.25f)
                 {
                     g_rtx.pl_samefr++;
-                    return;
+                    return -1;
                 }
                 continue;
             }
@@ -3256,27 +3308,34 @@ static void rt_place(uint32_t m, const float* w)
     if (moved >= 0)
     {
         RtPlace* p = &g_rtx.place[moved];
-        p->seen = g_serial;
+        p->seen = g_serial, p->missed = 0;
         if (best > 0.01f)
-            memcpy(p->w, w, 64), g_rtx.pl_moved++;
+            memcpy(p->w, w, 64), g_rtx.pl_moved++, me->n_move++;
         else
-            g_rtx.pl_same++;
-        return;
+            g_rtx.pl_same++, me->n_same++;
+        return moved;
     }
-    g_rtx.pl_new++;
+    if (me->nplace >= RT_PLACES)
+    {
+        g_rtx.pl_full++;
+        return -1;
+    }
+    g_rtx.pl_new++, me->n_move++;
     if (nt < 1e9f)
         g_rtx.pl_nd = nd, g_rtx.pl_nt = sqrtf(nt);
     if (g_rtx.nplace == g_rtx.cap_place)
         g_rtx.cap_place = g_rtx.cap_place ? g_rtx.cap_place * 2 : 1024,
         g_rtx.place = (RtPlace*)realloc(g_rtx.place, g_rtx.cap_place * sizeof *g_rtx.place);
     RtPlace* p = &g_rtx.place[g_rtx.nplace];
-    p->mesh = m, p->seen = g_serial;
+    p->mesh = m, p->seen = g_serial, p->missed = 0, p->gone = 0;
     memcpy(p->w, w, 64);
     me->nplace++;
+    int32_t at = (int32_t)g_rtx.nplace;
     if (4 * (g_rtx.nplace + 1) > g_rtx.nhead) /* the table's too full: bigger, with every place again */
         g_rtx.nplace++, rt_hash();
     else
         rt_hash_add(g_rtx.nplace++);
+    return at;
 }
 
 /* the mesh a fixed caster draws, kept from before or new */
@@ -3310,12 +3369,21 @@ static uint32_t rt_mesh(const Caster* c)
     return g_rtx.nmesh++;
 }
 
+/* the profile: the most places one mesh has */
+static uint32_t rt_most_places(void)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        n = g_rtx.mesh[i].nplace > n ? g_rtx.mesh[i].nplace : n;
+    return n;
+}
+
 /* The structures for this frame's scene (camera: clip_world, its view to the world view_world); 0 when
  * there is nothing to trace. Each fixed caster places its mesh (object space to the world: its own
  * transform through the camera's inverse); a mesh new to it is captured in its own space (clip space
  * back through the inverse of that transform). The rest - what moves, or a shader that places its
  * vertices some other way - is captured in the world, every frame. */
-static int rt_frame(const float* clip_world, const float* view_world, const float* proj)
+static int rt_frame(const float* clip_world, const float* view_world, const float* view, const float* proj)
 {
     if (!rt_init())
         return 0;
@@ -3329,6 +3397,9 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     if (!(g_serial & 127))
         rt_trim(0);
     rt_hash();
+    g_rtx.nnow = 0;
+    float vp[16];
+    mat_mul(vp, view, proj);
     typedef struct
     {
         const Caster* c;
@@ -3358,13 +3429,35 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
                     w[j] *= k;
                 placed = fabsf(w[3]) + fabsf(w[7]) + fabsf(w[11]) < 1e-3f;
             }
+            /* in the world: finite, and not far out (the sky's meshes, drawn around the camera at
+             * its infinite distance, are neither) - left out of the tracing */
+            int in = 1;
+            for (int j = 0; placed && in && j < 16; ++j)
+                in = isfinite(w[j]) && fabsf(w[j]) < (float)RT_WORLD;
+            if (placed && !in)
+            {
+                g_rtx.pl_far++;
+                continue;
+            }
         }
         RtMesh* me = NULL;
         uint32_t mi = UINT32_MAX;
         if (placed)
         {
             mi = rt_mesh(c);
-            rt_place(mi, w);
+            if (g_rtx.mesh[mi].unstable)
+            {
+                /* placed for this frame alone */
+                if (g_rtx.nnow == g_rtx.cap_now)
+                    g_rtx.cap_now = g_rtx.cap_now ? g_rtx.cap_now * 2 : 256,
+                    g_rtx.now = realloc(g_rtx.now, g_rtx.cap_now * sizeof *g_rtx.now);
+                g_rtx.now[g_rtx.nnow].mesh = mi;
+                memcpy(g_rtx.now[g_rtx.nnow++].w, w, 64);
+            }
+            else
+            {
+                rt_place(mi, w);
+            }
             me = &g_rtx.mesh[mi];
             me->seen = g_serial;
             if (me->blas || me->none || me->tried == g_serial)
@@ -3462,6 +3555,25 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     g_rtx.built = nstatic;
     g_rtx.prev = g_serial;
     free(jobs);
+    /* a place kept that the camera looks straight at (its origin well inside the view) and the game has
+     * not drawn for three frames traced is not there any more: a nearer or farther detail of the mesh
+     * is drawn in its stead, or it is out of the draw distance */
+    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+    {
+        RtPlace* p = &g_rtx.place[i];
+        if (p->gone || p->seen == g_serial)
+            continue;
+        float c[4];
+        for (int j = 0; j < 4; ++j)
+            c[j] = p->w[12] * vp[j] + p->w[13] * vp[4 + j] + p->w[14] * vp[8 + j] + vp[12 + j];
+        if (c[3] > 1.0f && fabsf(c[0]) < 0.8f * c[3] && fabsf(c[1]) < 0.8f * c[3])
+        {
+            if (++p->missed >= 3)
+                p->gone = 1, g_rtx.pl_gone++;
+        }
+        else
+            p->missed = 0;
+    }
     /* the instances: every place kept whose mesh has a structure, and what moves */
     NSMutableArray* list = [NSMutableArray arrayWithCapacity:g_rtx.nmesh + 1];
     g_rtx.nkept = g_rtx.kept_tris = 0;
@@ -3469,12 +3581,14 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     {
         RtMesh* me = &g_rtx.mesh[i];
         me->at = UINT32_MAX;
-        if (!me->dead && me->blas && me->nplace)
+        if (!me->dead && me->blas && (me->nplace || me->unstable))
             me->at = (uint32_t)list.count, [list addObject:me->blas], g_rtx.nkept++;
     }
     uint32_t ninst = 0;
     for (uint32_t i = 0; i < g_rtx.nplace; ++i)
-        ninst += g_rtx.place[i].seen + RT_KEEP >= g_serial && g_rtx.mesh[g_rtx.place[i].mesh].at != UINT32_MAX;
+        ninst += !g_rtx.place[i].gone && g_rtx.place[i].seen + RT_KEEP >= g_serial && g_rtx.mesh[g_rtx.place[i].mesh].at != UINT32_MAX;
+    for (uint32_t i = 0; i < g_rtx.nnow; ++i)
+        ninst += g_rtx.mesh[g_rtx.now[i].mesh].at != UINT32_MAX;
     g_rtx.moving_tris = dyn_verts / 3;
     uint32_t dyn_at = (uint32_t)list.count;
     if (g_rtx.dyn)
@@ -3489,19 +3603,20 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     MTLAccelerationStructureInstanceDescriptor* inst =
         (MTLAccelerationStructureInstanceDescriptor*)ring(ninst * sizeof *inst, 16, &ib, &ioff);
     uint32_t n = 0;
-    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+    for (uint32_t i = 0; i < g_rtx.nplace + g_rtx.nnow; ++i)
     {
-        RtPlace* p = &g_rtx.place[i];
-        RtMesh* me = &g_rtx.mesh[p->mesh];
-        if (p->seen + RT_KEEP < g_serial || me->at == UINT32_MAX)
+        int kept = i < g_rtx.nplace;
+        const float* pw = kept ? g_rtx.place[i].w : g_rtx.now[i - g_rtx.nplace].w;
+        RtMesh* me = &g_rtx.mesh[kept ? g_rtx.place[i].mesh : g_rtx.now[i - g_rtx.nplace].mesh];
+        if ((kept && (g_rtx.place[i].gone || g_rtx.place[i].seen + RT_KEEP < g_serial)) || me->at == UINT32_MAX)
             continue;
         memset(&inst[n], 0, sizeof inst[n]);
         /* column j of the (column-vector) transform is row j of the row-vector one */
         for (int j = 0; j < 4; ++j)
         {
-            inst[n].transformationMatrix.columns[j].x = p->w[4 * j];
-            inst[n].transformationMatrix.columns[j].y = p->w[4 * j + 1];
-            inst[n].transformationMatrix.columns[j].z = p->w[4 * j + 2];
+            inst[n].transformationMatrix.columns[j].x = pw[4 * j];
+            inst[n].transformationMatrix.columns[j].y = pw[4 * j + 1];
+            inst[n].transformationMatrix.columns[j].z = pw[4 * j + 2];
         }
         inst[n].options = MTLAccelerationStructureInstanceOptionOpaque;
         inst[n].mask = 0xFF;
@@ -3741,7 +3856,7 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 float invP[16], cw[16];
                 memcpy(u.vw, vinv, 64);
                 if (mat_inverse(invP, s->proj))
-                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->proj);
+                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj);
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
             u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
@@ -3829,9 +3944,10 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                         g_rtx.waiting);
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: places: %u as kept, %u moved, %u new, %u drawn again; "
-                        "a new one's nearest: %.5f rotation, %.4f units\n", g_rtx.pl_same, g_rtx.pl_moved, g_rtx.pl_new,
-                        g_rtx.pl_samefr, g_rtx.pl_nd, g_rtx.pl_nt),
-                    g_rtx.pl_same = g_rtx.pl_moved = g_rtx.pl_new = g_rtx.pl_samefr = 0;
+                        "a new one's nearest: %.5f rotation, %.4f units; %u not placed (out of the world), %u over %u a mesh; "
+                        "most a mesh has %u; %u dropped (in view, not drawn)\n", g_rtx.pl_same, g_rtx.pl_moved, g_rtx.pl_new, g_rtx.pl_samefr, g_rtx.pl_nd,
+                        g_rtx.pl_nt, g_rtx.pl_far, g_rtx.pl_full, (unsigned)RT_PLACES, rt_most_places(), g_rtx.pl_gone),
+                    g_rtx.pl_same = g_rtx.pl_moved = g_rtx.pl_new = g_rtx.pl_samefr = g_rtx.pl_far = g_rtx.pl_full = g_rtx.pl_gone = 0;
                 last = now, g_fx.st_frames = g_fx.st_own = g_fx.st_map = g_fx.st_cmax = 0;
             }
         }
