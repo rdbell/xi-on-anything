@@ -274,6 +274,10 @@ typedef struct GfxScene
  * effects - ambient occlusion from the depth it was drawn with, color grading - run on it in place
  * (FFXI_FX=1); back ends without them do nothing. */
 void gfx_scene_done(GfxTex* color, const GfxScene* s);
+/* The world is complete in that same target: sampled for the screen, or the frame presented. Its effects
+ * may have run before the last of it was drawn (FFXI draws some of the world after an effect-like
+ * layer); what needs all of it - the sun's shadow - is done here, once a frame. */
+void gfx_world_final(void);
 /* One scene-effect setting by its key in the settings file (fx, ao, fog, bloom, rays, ...). */
 void gfx_fx_set(const char* key, float v);
 /* Its value now (the settings file reloads while the game runs); 0 for a key it does not know. */

@@ -593,7 +593,7 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
     Sb b = { 0 };
     sb_printf(&b, "%s", PRELUDE);
     g_rt_pos = vk->prog ? gfx_msl_vs1_pos_consts(vs_tokens) : -1;
-    g_rt_wn = (vk->rt || fk->rt) && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
+    g_rt_wn = vk->rt && fk->rt && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
     /* traced: what the back end gives each draw (buffer 5, RtDraw in gfx_metal.m): clip space to the
      * world less the camera's place, the camera's place, toward the sun (w: 1 when there is one), the
      * shadow's strength and how far out it reaches (k.x, k.z; k.y: the debug view), and the sun's shadow

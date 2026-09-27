@@ -130,6 +130,7 @@ void gfx_present(GfxTex* backbuffer)
     prof_frame(gfx_now_ns());
 }
 void gfx_scene_done(GfxTex* color, const GfxScene* s) { (void)color, (void)s; }
+void gfx_world_final(void) {}
 void gfx_fx_set(const char* key, float v) { (void)key, (void)v; }
 float gfx_fx_get(const char* key) { return (void)key, 0.0f; }
 void gfx_trace_dump(const char* path) { (void)path; }

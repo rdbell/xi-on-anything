@@ -2838,6 +2838,7 @@ static struct
      * targets' scenes get no effects, cast no shadows and give no camera. */
     GfxTex* world;
     int world_done; /* the effects ran on it this frame: once a frame */
+    int final_done; /* gfx_world_final this frame */
     struct { GfxTex* t; uint32_t n; } tally[4]; /* this frame's 3D draws per target */
     uint32_t draws; /* 3D draws to it since the effects last ran */
     int done, cam;  /* the effects ran this frame; s holds a camera */
@@ -2908,6 +2909,15 @@ static void scene_note(GfxDraw* d)
     if (!c)
         return;
     int large = (uint64_t)rt->width * rt->height * 2 >= (uint64_t)g_dev.pp[0] * g_dev.pp[1];
+    /* the world sampled for the screen: complete, whatever came after its effects */
+    if (g_scene.world_done && !g_scene.final_done && large)
+    {
+        int sampled = 0;
+        for (int i = 0; i < 8; ++i)
+            sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
+        if (sampled)
+            g_scene.final_done = 1, gfx_world_final();
+    }
     if (g_scene.draws && !g_scene.done)
     {
         int sampled = 0;
@@ -2946,7 +2956,7 @@ static void scene_note(GfxDraw* d)
             break;
         }
     /* opaque 3D of the world not in its scene: traced with the next one (the back end's ray tracing) */
-    int opaque = d->depth.zwrite && (!d->pipe.blend || (d->fs.alpha_func && d->fs.alpha_func != 8));
+    int opaque = d->depth.zwrite;
     /* 3D into other targets - the game draws characters into one partway through the world, then
      * goes on with the world - is not the world's scene: it neither ends nor starts one */
     if (g_scene.world && c != g_scene.world)
@@ -2969,8 +2979,8 @@ static void scene_note(GfxDraw* d)
     /* what casts the sun's shadow (the back end's shadow map): the scene's opaque, depth-writing
      * draws - alpha-tested ones too (leaves, fences) - of the world, which is fogged or drawn by the
      * zone's shaders; not the sky, the sun and its flare (unfogged, with views of their own) */
-    d->caster = d->depth.zwrite && (!d->pipe.blend || (d->fs.alpha_func && d->fs.alpha_func != 8)) &&
-        (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
+    /* (the zone's terrain and cliffs are drawn blended - their layers - yet write depth: solid all the same) */
+    d->caster = d->depth.zwrite && (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
     d->receive = !d->vs.rhw && d->depth.zenable && (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
     const State* s = &g_dev.cur;
     GfxScene* sc = &g_scene.s;
@@ -3046,6 +3056,9 @@ static void scene_trace(GfxTex* world_before)
 static void scene_present(void)
 {
     scene_finish("present");
+    if (g_scene.world_done && !g_scene.final_done)
+        gfx_world_final();
+    g_scene.final_done = 0;
     GfxTex* world_before = g_scene.world;
     /* next frame's world: this frame's busiest target */
     uint32_t best = 0;

@@ -324,6 +324,115 @@ static void setup_nameplates(void)
 #endif
 }
 
+/* --- level of detail -----------------------------------------------------------------------------------
+ * Every map object (a zone's placed model, 0xf4 bytes, 2026-09-03) has three models: near at +0x18,
+ * middle at +0x14, far at +0x10, and two squared distances from the camera: past +0xcc it draws the
+ * far one, past +0xc8 the middle one, else the near one; an empty slot is not drawn at that range.
+ * Two passes pick this way: "lod_pick" (the object in ecx, its model in ebx) and "lod_pick2" (the
+ * object in edi, its model at [esp+0x54]), both hooked just after the pick. --lod near (the default)
+ * draws an object's near model at every distance when it has one; one without keeps the game's pick.
+ * FFXI_LODLOG=1 counts the objects each second: how many have no near model, how many have one
+ * model in every slot, how many really have levels, and how many picks were changed. */
+#ifdef FFXI_HOOK_LOD_PICK
+extern GuestFn rt_hook_lod_pick;
+#endif
+#ifdef FFXI_HOOK_LOD_PICK2
+extern GuestFn rt_hook_lod_pick2;
+#endif
+static int g_lod_near = 1; /* --lod: 1 near (the default), 0 as the game picks */
+static int g_lod_near_now; /* this frame's: the settings file's lod (1 near, 2 as the game picks) over --lod */
+static int g_lod_log;
+static uint32_t g_lod_count[4]; /* picks: no near model, one model in every slot, levels, changed */
+
+static uint32_t lod_pick_model(uint32_t obj, uint32_t model)
+{
+    uint32_t near = rd32(obj + 0x18);
+    if (g_lod_log)
+    {
+        uint32_t mid = rd32(obj + 0x14), far = rd32(obj + 0x10);
+        ++g_lod_count[!near ? 0 : near == mid && near == far ? 1 : 2];
+        if (g_lod_near_now && near && near != model)
+            ++g_lod_count[3];
+    }
+    return g_lod_near_now && near ? near : model;
+}
+
+static void lod_pick(Guest* g)
+{
+    g->ebx = lod_pick_model(g->ecx, g->ebx);
+}
+
+static void lod_pick2(Guest* g)
+{
+    wr32(g->esp + 0x54, lod_pick_model(g->edi, rd32(g->esp + 0x54)));
+}
+
+static void lod_frame(void)
+{
+    float live = gfx_fx_get("lod");
+    g_lod_near_now = live >= 0.5f && live < 1.5f ? 1 : live >= 1.5f ? 0 : g_lod_near;
+    if (!g_lod_log)
+        return;
+    static uint64_t last;
+    uint64_t now = rt_monotonic_ns();
+    if (!last)
+        last = now;
+    if (now - last < 1000000000ull)
+        return;
+    last = now;
+    rt_log("[recomp] lod: %u picks/s - %u no near model, %u one model, %u with levels; %u changed (%s)\n",
+        g_lod_count[0] + g_lod_count[1] + g_lod_count[2], g_lod_count[0], g_lod_count[1], g_lod_count[2], g_lod_count[3],
+        g_lod_near_now ? "near" : "as the game picks");
+    memset(g_lod_count, 0, sizeof g_lod_count);
+}
+
+static void setup_lod(void)
+{
+    const char* log = getenv("FFXI_LODLOG");
+    g_lod_log = log && log[0] && log[0] != '0';
+#if defined(FFXI_HOOK_LOD_PICK) && defined(FFXI_HOOK_LOD_PICK2)
+    rt_hook_lod_pick = lod_pick;
+    rt_hook_lod_pick2 = lod_pick2;
+    rt_log("[recomp] lod: %s\n", g_lod_near ? "near models at every distance" : "as the game picks");
+#else
+    (void)lod_pick, (void)lod_pick2;
+    if (g_lod_near)
+        rt_log("[recomp] lod: build %s has no level-of-detail hook; the game picks\n", FFXI_BUILD);
+#endif
+}
+
+/* --- culling -------------------------------------------------------------------------------------------
+ * 0x10181bb0 (2026-09-03) tests an object's box against a camera's clip matrix - the matrix at [esp+4]
+ * on entry, the box at [esp+8] - and returns nonzero when every corner is off one side, the object
+ * then not drawn. Its entry is hooked ("cull_test"): with the settings file's nocull (1) it is handed a
+ * matrix that puts every point at the middle of the view, every map object then drawn, in view or not
+ * (for testing: it costs a third of the frame rate). The game's test stands otherwise. */
+#ifdef FFXI_HOOK_CULL_TEST
+extern GuestFn rt_hook_cull_test;
+#endif
+static uint32_t g_cull_inside; /* the matrix: x, y, z 0 and w 1 for every point */
+
+static void cull_test(Guest* g)
+{
+    if (g_cull_inside && gfx_fx_get("nocull") >= 0.5f)
+        wr32(g->esp + 4, g_cull_inside);
+}
+
+static void setup_cull(void)
+{
+#ifdef FFXI_HOOK_CULL_TEST
+    g_cull_inside = gheap_alloc(64, 1);
+    float one = 1.0f;
+    uint32_t w;
+    memcpy(&w, &one, 4);
+    wr32(g_cull_inside + 60, w);
+    rt_hook_cull_test = cull_test;
+    rt_log("[recomp] cull: as the game culls (nocull=1 in the settings file: every map object drawn)\n");
+#else
+    (void)cull_test;
+#endif
+}
+
 /* s, or sx x sy (1.25, 1x1.2); 0 if it is neither */
 static int parse_scale(const char* s, float* sx, float* sy)
 {
@@ -368,6 +477,7 @@ static void present_hook(void)
     }
     fix_aspect();
     fix_draw_distance();
+    lod_frame();
     modern_frame();
     if (!g_fps_global)
         find_fps_global();
@@ -809,6 +919,8 @@ int main(int argc, char** argv)
     ModernSetup ms = { game, data_dir, &g_fps_divisor, fps_given, ui_aspect_given };
     modern_init(&ms);
     setup_nameplates();
+    setup_lod();
+    setup_cull();
     if (getenv("FFXI_PROFILE") && getenv("FFXI_PROFILE")[0] && getenv("FFXI_PROFILE")[0] != '0')
         thunk_timer = gfx_prof_shim, g_profile_shims = 1; /* the profile splits the game's time into its code and our API calls */
     dsound_setup();

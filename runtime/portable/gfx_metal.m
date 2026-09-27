@@ -141,7 +141,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1006,6 +1006,15 @@ static uint32_t* copy_tok(const uint32_t* t, uint32_t* n)
 static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_t* vs, const uint32_t* ps)
 {
     char* src = gfx_msl_generate(&k->lib.vs, &k->lib.fs, vs, ps);
+    if (src && k->lib.vs.shadow && k->lib.vs.prog && !access("/tmp/ffxi_dumpmsl", F_OK)) /* the check */
+    {
+        static int nd;
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/ffxi_shadow_vs%d.metal", nd++);
+        FILE* o = nd <= 4 ? fopen(path, "w") : NULL;
+        if (o)
+            fputs(src, o), fclose(o);
+    }
     if (!src)
     {
         __atomic_fetch_add(&g_failures, 1, __ATOMIC_RELAXED);
@@ -1240,6 +1249,10 @@ typedef struct Caster
     int32_t zbias;
     float cw[16]; /* a fixed-function draw's clip space back to the world, its own view and projection's */
 } Caster;
+
+/* the zone's fog as its shaders make it (c9.x, c9.z, c5.x, c10.x) and the frame it was seen in (rt_defer) */
+static float g_zfog[4];
+static uint64_t g_zfog_serial;
 
 static Caster* g_casters;
 static uint32_t g_ncasters, g_casters_cap;
@@ -1560,6 +1573,9 @@ static void draw_encode(const GfxDraw* d)
         }
         Caster* rec = d->caster == 1 && g_fxs.fx != 0.0f && (g_fxs.sun > 0.0f || g_fxs.rt > 0.0f) ? caster_new(d)
             : d->caster == 2 && g_fxs.fx != 0.0f && g_fxs.rt > 0.0f && !g_rt_face && !g_rt_level ? late_new(d) : NULL;
+        if (rec && d->vs.prog && d->caster == 1) /* the zone's fog: clamp((c9.z - w) c9.x, c5.x, c10.x) */
+            g_zfog[0] = d->u.vsc[9][0], g_zfog[1] = d->u.vsc[9][2], g_zfog[2] = d->u.vsc[5][0],
+            g_zfog[3] = d->u.vsc[10][0], g_zfog_serial = g_serial;
         if (rec)
         {
             rec->ub = [buf retain], rec->uoff = off;
@@ -2305,6 +2321,8 @@ static const struct
     { "rt_debug", offsetof(__typeof__(g_fxs), rt_debug), 0.0f },
     { "hide_ui", offsetof(__typeof__(g_fxs), hide_ui), 0.0f },
     { "rt_sm_keep", offsetof(__typeof__(g_fxs), rt_sm_keep), 0.0f },
+    { "rt_defer", offsetof(__typeof__(g_fxs), rt_defer), 1.0f },
+    { "rt_only_vs", offsetof(__typeof__(g_fxs), rt_only_vs), 0.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -3095,6 +3113,15 @@ static struct
     uint64_t fvp_serial;
     int fvp_ok, fvp_exact;
     uint32_t cam_draws;             /* draws given a camera this frame (the trace) */
+    float dc[4096][3];              /* the check: each zone draw's camera this frame */
+    const char* dsrc[4096];         /* where it came from, and its target */
+    const void* dtgt[4096];
+    const char* src;
+    char dc_note[512];
+    uint32_t ndc;
+    uint64_t dc_serial;
+    uint32_t dc_frames, dc_badframes, dc_bad, dc_all; /* the profile: draws off the frame's camera */
+    double dc_max;
     double fvp_vp[16];              /* the last exact camera the draws had (world to clip), and its frame */
     uint64_t fvp_vp_serial;
     uint32_t cam_from_draws;        /* the profile: frames whose scene took the draws' camera (no anchor drawn) */
@@ -3872,6 +3899,13 @@ static struct
     id<MTLRenderPipelineState> solid, alpha;
     id<MTLTexture> map;    /* a layer a cascade, nearest first */
     id<MTLTexture> scol;   /* the colour the casters' pipelines are built with (never kept) */
+    float rel[16];         /* the maps' camera: its clip space to the world less its place (the pass) */
+    id<MTLLibrary> dlib;   /* the pass (rt_defer) */
+    id<MTLRenderPipelineState> dpipe;
+    MTLPixelFormat dfmt;
+    uint32_t chk[2][2];    /* the check: vs / fixed-function casters' origins off / on the far map */
+    char chk_note[160];
+    char vx_note[512];
     SmCascade c[RT_CASCADES];
     int nc;                /* the cascades of the last maps */
     double cam[3]; /* the camera the maps' matrices are relative to (their scene's) */
@@ -4012,6 +4046,7 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
     [e setViewport:(MTLViewport){ 0, 0, RT_MAP, RT_MAP, 0, 1 }];
     [e setDepthStencilState:g_fx.sdepth];
     [e setCullMode:MTLCullModeNone];
+    [e setDepthClipMode:MTLDepthClipModeClamp];
     [e setDepthBias:0 slopeScale:1.5f clamp:0];
     double km[16], md[16];
     for (int j = 0; j < 16; ++j)
@@ -4025,6 +4060,8 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
     for (uint32_t i = 0; i < total; ++i)
     {
         const Caster* cs = i < g_ncasters ? &g_casters[i] : &g_late[i - g_ncasters];
+        if (g_fxs.rt_only_vs != 0.0f && cs->has_cw) /* the check: zone shaders alone */
+            continue;
         if (cs->has_cw) /* fixed function: its own view back to the world */
         {
             double cw[16], m2[16];
@@ -4033,20 +4070,87 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             for (int r = 0; r < 4; ++r)
                 for (int j = 0; j < 3; ++j)
                     cw[r * 4 + j] -= cam[j] * cw[r * 4 + 3];
+            if (0.5 * cw[11] + cw[15] < 0.0)
+                for (int j = 0; j < 16; ++j)
+                    cw[j] = -cw[j];
             matd_mul(m2, cw, km);
             float m[16];
             for (int j = 0; j < 16; ++j)
                 m[j] = (float)m2[j];
             [e setVertexBytes:m length:64 atIndex:5];
         }
+        else if (g_fxs.rt_only_vs >= 2.0f) /* the check: the camera's own view, depth a half */
+        {
+            static const float T[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5f, 1 };
+            [e setVertexBytes:T length:64 atIndex:5];
+        }
         else
             [e setVertexBytes:M length:64 atIndex:5];
+        if (layer == 2 && cs->ub) /* the check: where the caster's origin lands on the map */
+        {
+            const GfxU* cu = (const GfxU*)((const uint8_t*)[cs->ub contents] + cs->uoff);
+            float o[4] = { 0, 0, 0, 1 }, c[4], q[4];
+            const float* use = cs->has_cw ? NULL : M;
+            if (cs->lib.vs.prog)
+                for (int r = 0; r < 4; ++r)
+                    c[r] = cu->vsc[r][3]; /* origin: each row's w (dp4 of (0,0,0,1)) */
+            else
+                for (int r = 0; r < 4; ++r)
+                    c[r] = cu->wvp[12 + r];
+            (void)o;
+            float mm[16];
+            if (!use)
+            {
+                double cw[16], m2[16];
+                for (int j = 0; j < 16; ++j)
+                    cw[j] = cs->cw[j];
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 3; ++j)
+                        cw[r * 4 + j] -= cam[j] * cw[r * 4 + 3];
+                matd_mul(m2, cw, km);
+                for (int j = 0; j < 16; ++j)
+                    mm[j] = (float)m2[j];
+                use = mm;
+            }
+            for (int j = 0; j < 4; ++j)
+                q[j] = c[0] * use[j] + c[1] * use[4 + j] + c[2] * use[8 + j] + c[3] * use[12 + j];
+            int in = q[3] != 0.0f && fabsf(q[0] / q[3]) < 1.0f && fabsf(q[1] / q[3]) < 1.0f && q[2] / q[3] > 0.0f && q[2] / q[3] < 1.0f;
+            g_sm.chk[cs->lib.vs.prog ? 0 : 1][in]++;
+            /* a zone-shader caster that is neither alpha-tested nor small: one of its vertices through it */
+            const GfxElem* el = &cs->lib.vs.el[0];
+            if (cs->lib.vs.prog && !alpha_tested(&cs->lib.fs) && cs->n > 300 && cu->vsc[3][3] > 5.0f && cu->vsc[3][3] < 150.0f && el->used && el->type == GFX_FLOAT3 &&
+                cs->vb[el->stream] && [cs->vb[el->stream] contents] && strlen(g_sm.vx_note) < 300)
+            {
+                const uint8_t* vb = (const uint8_t*)[cs->vb[el->stream] contents] + cs->voff[el->stream];
+                int32_t vi = (int32_t)cs->vstart + cu->vofs;
+                if (cs->itype && cs->ib && [cs->ib contents])
+                {
+                    const uint8_t* ib = (const uint8_t*)[cs->ib contents] + cs->ioff;
+                    vi = (cs->itype == 2 ? (int32_t)((const uint16_t*)ib)[0] : (int32_t)((const uint32_t*)ib)[0]) + cu->vofs;
+                }
+                const float* v = (const float*)(vb + (size_t)vi * cu->stride[el->stream] + cu->offset[0]);
+                float pc[4], pq[4];
+                for (int r = 0; r < 4; ++r)
+                    pc[r] = v[0] * cu->vsc[r][0] + v[1] * cu->vsc[r][1] + v[2] * cu->vsc[r][2] + cu->vsc[r][3];
+                for (int j = 0; j < 4; ++j)
+                    pq[j] = pc[0] * use[j] + pc[1] * use[4 + j] + pc[2] * use[8 + j] + pc[3] * use[12 + j];
+                char t[128];
+                snprintf(t, sizeof t, " [n%u v %.0f %.0f %.0f clip %.0f %.0f %.0f %.0f map %.2f %.2f %.2f]", cs->n, v[0], v[1], v[2],
+                    pc[0], pc[1], pc[2], pc[3], pq[0] / pq[3], pq[1] / pq[3], pq[2] / pq[3]);
+                strcat(g_sm.vx_note, t);
+            }
+            if (!in && g_sm.chk_note[0] == 0)
+                snprintf(g_sm.chk_note, sizeof g_sm.chk_note, "%s clip %.1f %.1f %.1f %.1f -> map %.2f %.2f %.2f",
+                    cs->lib.vs.prog ? "vs" : "ffp", c[0], c[1], c[2], c[3], q[0] / q[3], q[1] / q[3], q[2] / q[3]);
+        }
         PipeKey pk;
         memset(&pk, 0, sizeof pk);
         pk.lib = cs->lib;
         pk.lib.vs.shadow = 1, pk.lib.vs.pixel = 0, pk.lib.vs.rt = 0, pk.lib.fs.rt = 0;
+        /* every caster with its own functions whole (the position-alone variant drew nothing of the
+         * zone's shaders); an alpha-tested one's test done with its textures */
         int at = alpha_tested(&cs->lib.fs);
-        if (!at)
+        if (0)
         {
             /* the position alone: one pipeline serves every draw with the same vertex layout */
             GfxVsKey* v = &pk.lib.vs;
@@ -4065,7 +4169,7 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         for (int st = 0; st < GFX_NSTREAMS; ++st)
             [e setVertexBuffer:cs->vb[st] offset:cs->voff[st] atIndex:(NSUInteger)st];
         [e setVertexBuffer:cs->ub offset:cs->uoff atIndex:4];
-        if (at)
+        (void)at;
         {
             [e setFragmentBuffer:cs->ub offset:cs->uoff atIndex:4];
             for (int t = 0; t < 8; ++t)
@@ -4084,6 +4188,163 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             [e drawPrimitives:cs->prim vertexStart:cs->vstart vertexCount:cs->n];
         g_sm.drawn++;
     }
+    [e endEncoding];
+}
+
+/* --- the sun's shadow on the finished world (rt_defer) ------------------------------------------------
+ * Once the world is drawn and before its effects: each pixel's place from the world's depth through the
+ * same camera the maps' casters went through (this frame's), looked up in the maps; the colour darkened
+ * where something stands between it and the sun, the fog's share of it left as it was. Casters and what
+ * receives go through one matrix in one frame: an error in it moves both alike. */
+static const char DS_MSL[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
+    "            float4 pz; };\n"
+    "struct DO { float4 pos [[position]]; };\n"
+    "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
+    "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    /* the place (less the camera's) at pixel px: its depth through the camera back to the world */
+    "static float3 ds_at(constant DS& d, depth2d<float> dep, int2 px, thread float& z) {\n"
+    "  z = dep.read(uint2(clamp(px, int2(0), int2(dep.get_width() - 1, dep.get_height() - 1))));\n"
+    "  float2 ndc = (float2(px) + 0.5 - d.vp.xy) / d.vp.zw * 2.0 - 1.0;\n"
+    "  float zn = (z - d.pz.z) / max(d.pz.w - d.pz.z, 1e-6);\n"
+    "  float4 w = d.ivp * float4(ndc.x, -ndc.y, zn, 1.0);\n"
+    "  return w.xyz / w.w;\n"
+    "}\n"
+    "static float ds_look(constant DS& d, depth2d_array<float> t, int c, float3 p, float3 n) {\n"
+    "  constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
+    "  float4 q = d.s[c] * float4(p + n * d.cs[c].x, 1.0);\n"
+    "  if (any(abs(q.xy) > 0.98) || q.z <= 0.0 || q.z >= 1.0) return -1.0;\n"
+    "  float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+    "  float z = q.z - d.cs[c].z, st = d.cs[c].y, s = 0.0;\n"
+    "  for (int j = 0; j < 4; ++j)\n"
+    "    for (int i = 0; i < 4; ++i)\n"
+    "      s += t.sample_compare(cmp, uv + (float2(i, j) - 1.5) * st, uint(c), z);\n"
+    "  return s / 16.0;\n"
+    "}\n"
+    "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
+    "                      depth2d_array<float> sm [[texture(1)]]) {\n"
+    "  int2 px = int2(in.pos.xy);\n"
+    /* rt_debug 2..4: a cascade's map itself over the view (nearest dark) */
+    "  if (d.k.z >= 1.5) {\n"
+    "    float2 uv = (in.pos.xy - d.vp.xy) / d.vp.zw; uv.x = uv.x * d.vp.w / d.vp.z;\n"
+    "    if (uv.x > 1.0) return float4(0.1, 0.1, 0.3, 1.0);\n"
+    "    float m = sm.read(uint2(uv * float2(sm.get_width(), sm.get_height())), uint(d.k.z - 2.0 + 0.5));\n"
+    "    return float4(float3(m), 1.0);\n"
+    "  }\n"
+    "  float z, zx0, zx1, zy0, zy1;\n"
+    "  float3 p = ds_at(d, dep, px, z);\n"
+    "  if (z >= 1.0) return float4(0.0);\n"
+    /* the face: toward the nearer neighbour on each axis (the far one may be another object) */
+    "  float3 px0 = ds_at(d, dep, px - int2(1, 0), zx0), px1 = ds_at(d, dep, px + int2(1, 0), zx1);\n"
+    "  float3 py0 = ds_at(d, dep, px - int2(0, 1), zy0), py1 = ds_at(d, dep, px + int2(0, 1), zy1);\n"
+    "  float3 ex = abs(zx1 - z) < abs(z - zx0) ? px1 - p : p - px0;\n"
+    "  float3 ey = abs(zy1 - z) < abs(z - zy0) ? py1 - p : p - py0;\n"
+    "  float3 n = cross(ex, ey);\n"
+    "  float nn = dot(n, n);\n"
+    "  n = nn > 1e-20 ? n * rsqrt(nn) : float3(0.0, -1.0, 0.0);\n"
+    "  if (dot(n, p) > 0.0) n = -n;\n"
+    "  float dist = length(p);\n"
+    "  if (dist >= d.k.y) return float4(0.0);\n"
+    "  int c = dist < d.cs[0].w ? 0 : dist < d.cs[1].w ? 1 : 2;\n"
+    "  float v = ds_look(d, sm, c, p, n);\n"
+    "  if (v < 0.0 && c < 2) c++, v = ds_look(d, sm, c, p, n);\n"
+    "  float bl = c < 2 ? smoothstep(0.8 * d.cs[c].w, d.cs[c].w, dist) : 0.0;\n"
+    "  if (bl > 0.0) {\n"
+    "    float v2 = ds_look(d, sm, c + 1, p, n);\n"
+    "    if (v2 >= 0.0) v = v < 0.0 ? v2 : mix(v, v2, bl);\n"
+    "  }\n"
+    "  if (v < 0.0) return d.k.z > 0.0 ? float4(0.8, 0.1, 0.1, 1.0) : float4(0.0);\n"
+    "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
+    /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
+    "  float f = 1.0;\n"
+    "  if (d.fog.w > 0.0) {\n"
+    "    float zn = (z - d.pz.z) / max(d.pz.w - d.pz.z, 1e-6);\n"
+    "    float w = d.pz.y / (zn - d.pz.x);\n"
+    "    f = saturate(clamp((d.fog.y - abs(w)) * d.fog.x, d.fog.z, d.fog.w));\n"
+    "  }\n"
+    "  if (d.k.z > 0.0) return float4(float3(0.15 + 0.85 * v), 1.0);\n"
+    "  return float4((1.0 - f) * d.fogc.rgb * a, a);\n"
+    "}\n";
+
+typedef struct DsU
+{
+    float ivp[16];
+    float s[RT_CASCADES][16];
+    float cs[RT_CASCADES][4];
+    float sun[4];
+    float k[4];    /* strength, how far, the debug view, - */
+    float fog[4];  /* c9.x, c9.z, c5.x, c10.x (w <= 0: no fog) */
+    float fogc[4];
+    float vp[4];   /* the scene's viewport in the target */
+    float pz[4];   /* P22, P32 (z = P22 + P32 / w), the viewport's depth range */
+} DsU;
+
+/* the pass into ct (its depth dep), for scene s */
+static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* s, const float* vp)
+{
+    if (!g_sm.ok || !g_sm.map)
+        return;
+    if (!g_sm.dlib)
+        g_sm.dlib = compile(DS_MSL);
+    if (!g_sm.dlib)
+        return;
+    if (!g_sm.dpipe || g_sm.dfmt != ct.pixelFormat)
+    {
+        [g_sm.dpipe release];
+        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+        id<MTLFunction> vf = [g_sm.dlib newFunctionWithName:@"ds_vs"], ff = [g_sm.dlib newFunctionWithName:@"ds_fs"];
+        pd.vertexFunction = vf, pd.fragmentFunction = ff;
+        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
+        ca.pixelFormat = ct.pixelFormat;
+        ca.blendingEnabled = YES; /* out = src + dst (1 - a): darkened by a, the fog's share given back */
+        ca.rgbBlendOperation = ca.alphaBlendOperation = MTLBlendOperationAdd;
+        ca.sourceRGBBlendFactor = MTLBlendFactorOne, ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        ca.sourceAlphaBlendFactor = MTLBlendFactorZero, ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        NSError* err = nil;
+        g_sm.dpipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!g_sm.dpipe)
+            fprintf(stderr, "[recomp] gfx: rt: shadow pass failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+        g_sm.dfmt = ct.pixelFormat;
+        [vf release], [ff release], [pd release];
+        if (!g_sm.dpipe)
+            return;
+    }
+    DsU u;
+    memset(&u, 0, sizeof u);
+    memcpy(u.ivp, g_sm.rel, 64);
+    for (int c = 0; c < RT_CASCADES; ++c)
+    {
+        const SmCascade* k = &g_sm.c[c < g_sm.nc ? c : g_sm.nc - 1];
+        memcpy(u.s[c], k->m, 64);
+        /* two texels off the face along its normal, a texel of depth, a filter step of a texel and a half */
+        u.cs[c][0] = (float)(2.0 * k->texel), u.cs[c][1] = 1.5f / RT_MAP;
+        u.cs[c][2] = (float)(k->texel / k->range), u.cs[c][3] = (float)k->reach;
+    }
+    memcpy(u.sun, g_rtx.sun_now, 16);
+    u.k[0] = g_rtx.k_now[0], u.k[1] = g_rtx.k_now[2], u.k[2] = g_fxs.rt_debug;
+    if (g_zfog_serial == g_serial && g_zfog[0] != 0.0f)
+        memcpy(u.fog, g_zfog, 16);
+    memcpy(u.fogc, s->fogcolor, 16);
+    memcpy(u.vp, vp, 16);
+    float minz, maxz;
+    memcpy(&minz, &s->vp[4], 4), memcpy(&maxz, &s->vp[5], 4);
+    if (maxz <= minz)
+        minz = 0, maxz = 1;
+    u.pz[0] = s->proj[10], u.pz[1] = s->proj[14], u.pz[2] = minz, u.pz[3] = maxz;
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = ct;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:g_sm.dpipe];
+    [e setViewport:(MTLViewport){ vp[0], vp[1], vp[2], vp[3], 0, 1 }];
+    [e setFragmentBytes:&u length:sizeof u atIndex:0];
+    [e setFragmentTexture:dep atIndex:0];
+    [e setFragmentTexture:g_sm.map atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
 
@@ -4127,9 +4388,52 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
     for (int r = 0; r < 4; ++r)
         for (int j = 0; j < 3; ++j)
             rel[r * 4 + j] -= cam[j] * rel[r * 4 + 3];
+    /* w positive for what is in view (the same points either sign, but the rasterizer clips a negative
+     * w: this camera's projection makes w -z, and its inverse came out negative) */
+    if (0.5 * rel[11] + rel[15] < 0.0)
+        for (int j = 0; j < 16; ++j)
+            rel[j] = -rel[j];
+    for (int j = 0; j < 16; ++j)
+        g_sm.rel[j] = (float)rel[j];
     g_sm.drawn = 0, g_sm.instances = g_ncasters;
     for (int c = 0; c < g_sm.nc; ++c)
         rt_map_casters((uint32_t)c, &g_sm.c[c], rel, cam);
+    /* the check: /tmp/ffxi_dumpmap there - each cascade's map to /tmp/ffxi_map<c>.pgm (1024 across) */
+    if (!access("/tmp/ffxi_dumpmap", F_OK))
+    {
+        remove("/tmp/ffxi_dumpmap");
+        id<MTLBuffer> rb = [g_dev newBufferWithLength:(NSUInteger)RT_MAP * RT_MAP * 4 * 3 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+        for (int c = 0; c < 3; ++c)
+            [b copyFromTexture:g_sm.map sourceSlice:(NSUInteger)c sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(RT_MAP, RT_MAP, 1) toBuffer:rb destinationOffset:(NSUInteger)c * RT_MAP * RT_MAP * 4
+               destinationBytesPerRow:RT_MAP * 4 destinationBytesPerImage:RT_MAP * RT_MAP * 4];
+        [b endEncoding];
+        [cmd() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            (void)cb;
+            const float* f = (const float*)[rb contents];
+            for (int c = 0; c < 3; ++c)
+            {
+                char path[64];
+                snprintf(path, sizeof path, "/tmp/ffxi_map%d.pgm", c);
+                FILE* o = fopen(path, "wb");
+                if (!o)
+                    continue;
+                fprintf(o, "P5 1024 1024 255\n");
+                for (int y = 0; y < 1024; ++y)
+                    for (int x = 0; x < 1024; ++x)
+                    {
+                        float v = 1.0f;
+                        for (int j = 0; j < 4; ++j) /* the nearest of 4x4: small casters stay */
+                            for (int i = 0; i < 4; ++i)
+                                v = fminf(v, f[(size_t)c * RT_MAP * RT_MAP + (size_t)(y * 4 + j) * RT_MAP + x * 4 + i]);
+                        fputc((int)(fminf(fmaxf(v, 0.0f), 1.0f) * 255.0f), o);
+                    }
+                fclose(o);
+            }
+            [rb release];
+        }];
+    }
     g_sm.ok = 1;
 }
 
@@ -4265,6 +4569,27 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
             g_rtx.have_vp_prev = g_rtx.have_vp_last && g_rtx.vp_last_serial + 1 == g_serial;
             memcpy(g_rtx.vp_prev, g_rtx.vp_last, sizeof vpn);
             memcpy(g_rtx.vp_last, vpn, sizeof vpn);
+            if (g_rtx.dc_serial == g_serial && fabs(vpinv[11]) > 1e-12)
+            {
+                double fc[3] = { vpinv[8] / vpinv[11], vpinv[9] / vpinv[11], vpinv[10] / vpinv[11] };
+                uint32_t bad = 0;
+                for (uint32_t i = 0; i < g_rtx.ndc; ++i)
+                {
+                    double dx = g_rtx.dc[i][0] - fc[0], dy = g_rtx.dc[i][1] - fc[1], dz = g_rtx.dc[i][2] - fc[2];
+                    double dd = sqrt(dx * dx + dy * dy + dz * dz);
+                    bad += dd > 0.01;
+                    g_rtx.dc_max = fmax(g_rtx.dc_max, dd);
+                    if (dd > 0.01 && strlen(g_rtx.dc_note) < 400)
+                    {
+                        char t[96];
+                        snprintf(t, sizeof t, " %s/%s/%.0f", g_rtx.dsrc[i] ? g_rtx.dsrc[i] : "?",
+                            g_rtx.dtgt[i] == g_rtx.dtgt[g_rtx.ndc - 1] ? "main" : "other", dd);
+                        if (!strstr(g_rtx.dc_note, t))
+                            strcat(g_rtx.dc_note, t);
+                    }
+                }
+                g_rtx.dc_frames++, g_rtx.dc_badframes += bad > 0, g_rtx.dc_bad += bad, g_rtx.dc_all += g_rtx.ndc;
+            }
             g_rtx.have_vp_last = 1, g_rtx.vp_last_serial = g_serial;
         }
     }
@@ -4693,7 +5018,8 @@ static int rt_inpass(void)
 
 static int rt_draw_wanted(const GfxDraw* d)
 {
-    return (d->caster == 1 || d->caster == 2 || d->receive) && !d->vs.rhw && !g_rt_face && !g_rt_level && g_sm.ok && rt_inpass();
+    return g_fxs.rt_defer == 0.0f && (d->caster == 1 || d->caster == 2 || d->receive) && !d->vs.rhw && !g_rt_face && !g_rt_level &&
+        g_sm.ok && rt_inpass();
 }
 
 /* clip space back to the world less the camera's place (m) and that place (cam), from world to clip */
@@ -4745,6 +5071,8 @@ static void rt_cam_log(const char* what)
     static int tried, lines;
     if (!tried)
         tried = 1, f = getenv("FFXI_RTCAM") ? fopen(getenv("FFXI_RTCAM"), "w") : NULL;
+    if (strncmp(what, "maps", 4) && strcmp(what, "solo-held"))
+        g_rtx.src = what;
     if (!f || ++lines > 200000)
         return;
     fprintf(f, "%llu t%p %s cam %.3f %.3f %.3f ok %d exact %d draw %u\n", (unsigned long long)g_serial, (void*)g_rt, what,
@@ -4874,7 +5202,7 @@ static int rt_frame_camera(const GfxDraw* d, RtDraw* rd)
                     take = (g_rtx.fvp_ok && dg < 0.25f) || (g_rtx.have_pend && dp < 0.01f);
                 if (take == 1)
                 {
-                    const char* why = g_rtx.fvp_exact ? "solo-switch" : "solo";
+                    const char* why = g_rtx.fvp_exact ? (chain ? "chain-switch" : "solo-switch") : (chain ? "chain" : "solo");
                     memcpy(g_rtx.fvp_m, m, 64), memcpy(g_rtx.fvp_cam, cam, 16);
                     memcpy(g_rtx.fvp_vp, vp, sizeof vp), g_rtx.fvp_vp_serial = g_serial;
                     g_rtx.fvp_ok = g_rtx.fvp_exact = 1, g_rtx.have_pend = 0, g_rtx.dr_solo++;
@@ -4934,6 +5262,10 @@ static void rt_draw_bind(const GfxDraw* d, id<MTLRenderCommandEncoder> e)
         ok = rt_frame_camera(d, &rd);
         if (ok)
             g_rtx.fvp_exact ? g_rtx.dr_exact++ : g_rtx.dr_pred++;
+        if (ok && g_rtx.dc_serial != g_serial)
+            g_rtx.dc_serial = g_serial, g_rtx.ndc = 0;
+        if (ok && d->vs.prog && g_rtx.ndc < 4096) /* the check: the camera each draw had (rt_frame) */
+            g_rtx.dsrc[g_rtx.ndc] = g_rtx.src, g_rtx.dtgt[g_rtx.ndc] = g_rt, memcpy(g_rtx.dc[g_rtx.ndc++], rd.cam, 12);
     }
     if (ok)
     {
@@ -5016,6 +5348,32 @@ void gfx_trace_dump(const char* path)
             t->cam[2], t->depth, t->dl, t->al, t->fog[0], t->fog[1], t->fog[2]);
     }
     fclose(f);
+}
+
+/* the scene gfx_scene_done saw last, for gfx_world_final */
+static struct
+{
+    GfxTex* color;
+    GfxScene scene;
+    float cw[16], vinv[16], vp[4];
+    uint64_t serial;
+} g_wf;
+
+void gfx_world_final(void)
+{
+    if (!g_dev || g_wf.serial != g_serial || !g_wf.color || g_fxs.rt_defer == 0.0f || g_fxs.rt <= 0.0f)
+        return;
+    g_wf.serial = 0;
+    @autoreleasepool
+    {
+        flush_pass();
+        GfxTex* color = g_wf.color;
+        const GfxScene* s = &g_wf.scene;
+        id<MTLTexture> depth = color->depth_world ? color->depth_world : color->depth_seen;
+        rt_frame(g_wf.cw, g_wf.vinv, s->view, s->proj, s->cam != 0);
+        if (rt_inpass() && depth && depth.width == color->tex.width && depth.height == color->tex.height)
+            rt_defer_pass(color->tex, depth, s, g_wf.vp);
+    }
 }
 
 void gfx_scene_done(GfxTex* color, const GfxScene* s)
@@ -5194,8 +5552,20 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 float strength = g_fxs.rt_shadow * (g_fxs.rt_sun_elev != 0.0f ? 1.0f : g_rtx.day);
                 g_rtx.sun_now[3] = strength > 0.0f ? g_rtx.sun_now[3] : 0.0f;
                 g_rtx.k_now[0] = strength, g_rtx.k_now[2] = fmaxf(g_fxs.rt_distance, 1.0f);
+                /* the structures, the sun's maps and its shadow once the world is complete (gfx_world_final:
+                 * some of it comes after its effects); with the in-pass shading, here */
                 if (mat_inverse(invP, s->proj))
-                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->view, s->proj, s->cam != 0);
+                {
+                    mat_mul(cw, invP, vinv);
+                    if (g_fxs.rt_defer != 0.0f)
+                    {
+                        g_wf.color = color, g_wf.scene = *s, g_wf.serial = g_serial;
+                        memcpy(g_wf.cw, cw, 64), memcpy(g_wf.vinv, vinv, 64);
+                        g_wf.vp[0] = vx, g_wf.vp[1] = vy, g_wf.vp[2] = vw, g_wf.vp[3] = vh;
+                    }
+                    else
+                        traced = rt_frame(cw, vinv, s->view, s->proj, s->cam != 0);
+                }
                 memcpy(u.ivp, g_rtx.ray_ivp, 64), memcpy(u.cam, g_rtx.ray_cam, 12);
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
@@ -5286,18 +5656,21 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
                         "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
-                        "instances, %u draws, texels %.3f / %.3f / %.3f units\n", g_rtx.dr_exact,
+                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); terrain:%s\n", g_rtx.dr_exact,
                         g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
-                        g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel),
+                        g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel, g_sm.chk[0][1], g_sm.chk[0][0] + g_sm.chk[0][1],
+                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.vx_note),
+                    memset(g_sm.chk, 0, sizeof g_sm.chk), g_sm.chk_note[0] = 0, g_sm.vx_note[0] = 0,
                     g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
                     fprintf(stderr, "[recomp] gfx: rt: camera from anchors %u frames (%.1f agreeing, spread at most %.5f units), the "
-                        "scene's %u; %u chained, %u from the draws, %u the scene's own, %u guessed (chain: %u tries, %u meshes drawn, %u as often as before, %u drawn the frame before, %u pairs, %u agreeing); %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,
+                        "scene's %u; draws' camera off the frame's: %u of %u frames, %u of %u draws, at most %.4f [%s]; %u chained, %u from the draws, %u the scene's own, %u guessed (chain: %u tries, %u meshes drawn, %u as often as before, %u drawn the frame before, %u pairs, %u agreeing); %u anchors; the scene's camera off by at most %.4f units; %u new zones\n", g_rtx.anchored,
                         g_rtx.anchored ? (double)g_rtx.cam_agree / g_rtx.anchored : 0.0, g_rtx.cam_spread, g_rtx.anchor_fallback,
-                        g_rtx.cam_chain, g_rtx.cam_from_draws, g_rtx.cam_fresh, g_rtx.cam_guessed, g_rtx.ch_calls, g_rtx.ch_seen, g_rtx.ch_samecount, g_rtx.ch_prev,
+                        g_rtx.dc_badframes, g_rtx.dc_frames, g_rtx.dc_bad, g_rtx.dc_all, g_rtx.dc_max, g_rtx.dc_note, g_rtx.cam_chain, g_rtx.cam_from_draws, g_rtx.cam_fresh, g_rtx.cam_guessed, g_rtx.ch_calls, g_rtx.ch_seen, g_rtx.ch_samecount, g_rtx.ch_prev,
                         g_rtx.ch_cand, g_rtx.ch_most, g_rtx.nanchor, g_rtx.cam_scene, g_rtx.zones),
                     g_rtx.zones = 0, g_rtx.cam_from_draws = g_rtx.cam_chain = g_rtx.cam_guessed = g_rtx.cam_fresh = 0,
+                    g_rtx.dc_badframes = g_rtx.dc_frames = g_rtx.dc_bad = g_rtx.dc_all = 0, g_rtx.dc_max = 0.0, g_rtx.dc_note[0] = 0,
                     g_rtx.ch_calls = g_rtx.ch_cand = g_rtx.ch_most = g_rtx.ch_seen = g_rtx.ch_samecount = g_rtx.ch_prev = 0,
                     g_rtx.anchored = g_rtx.anchor_fallback = g_rtx.cam_agree = 0, g_rtx.cam_spread = g_rtx.cam_scene = 0.0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
@@ -5322,7 +5695,8 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
             g_fx.tr_live = g_fx.tr_cached = g_fx.tr_skipped = 0, g_fx.tr_strength = g_fx.tr_day = 0;
         }
         g_fx.st_drawn_this = 0;
-        casters_clear();
+        if (g_wf.serial != g_serial) /* kept for gfx_world_final otherwise (the frame's end clears them) */
+            casters_clear();
         if (gfx_profiling)
             g_prof.draw_ns += gfx_now_ns() - t0;
     }

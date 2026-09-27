@@ -2087,6 +2087,7 @@ static void draw_overlay(uint32_t w, uint32_t h)
 
 /* the scene effects are Metal's so far (gfx_metal.m) */
 void gfx_scene_done(GfxTex* color, const GfxScene* s) { (void)color, (void)s; }
+void gfx_world_final(void) {}
 /* but for the frame-rate overlay's */
 void gfx_fx_set(const char* key, float v)
 {
