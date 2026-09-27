@@ -200,15 +200,57 @@ static int matrix_op(Sb* b, uint32_t op, const uint32_t* p)
     return 1;
 }
 
+/* The constant register a vs.1.x shader's position transform starts at: four dp4 (x, y, z, w) of v0
+ * with c[k] .. c[k + 3], or m4x4 of v0 with c[k], written to oPos directly or to a temporary that is
+ * then moved to oPos whole. -1 when the shader places its vertices some other way. */
+int gfx_msl_vs1_pos_consts(const uint32_t* t)
+{
+    if (!t || (t[0] & 0xFFFF0000u) != 0xFFFE0000u)
+        return -1;
+    int k = -1, dp = 0;
+    uint32_t dst = 0;
+    for (uint32_t i = 1; i < 65536;)
+    {
+        uint32_t tok = t[i], op = tok & 0xFFFF;
+        if (tok == 0x0000FFFFu)
+            break;
+        if (op == 0xFFFE)
+        {
+            i += 1 + ((tok >> 16) & 0x7FFF);
+            continue;
+        }
+        int np = nparams(op, 0);
+        if (np < 0)
+            return -1;
+        const uint32_t* p = &t[i + 1];
+        uint32_t d = p[0] & 0x700007FFu, mask = (p[0] >> 16) & 0xF;
+        /* v0 whole (no swizzle, no modifier) against a constant, not relative */
+        int v0 = np >= 3 && (p[1] & 0x7FFFE7FFu) == ((uint32_t)R_INPUT << 28 | 0xE4u << 16) &&
+            ((p[2] >> 28) & 7) == R_CONST && !(p[2] & 0x2000) && ((p[2] >> 16) & 0xFF) == 0xE4 && !((p[2] >> 24) & 0xF);
+        if (op == 20 && v0 && k < 0) /* m4x4 */
+            k = (int)(p[2] & 0x7FF), dst = d, dp = 4;
+        else if (op == 9 && v0 && dp < 4 && mask == 1u << dp && (dp == 0 || (d == dst && (int)(p[2] & 0x7FF) == k + dp)))
+        {
+            if (dp == 0)
+                k = (int)(p[2] & 0x7FF), dst = d;
+            dp++;
+        }
+        if (dp == 4 && dst == ((uint32_t)R_RASTOUT << 28))
+            return k;
+        /* mov oPos, r# */
+        if (dp == 4 && op == 1 && d == ((uint32_t)R_RASTOUT << 28) && (p[1] & 0x7FFF07FFu) == (dst | 0xE4u << 16))
+            return k;
+        i += 1 + (uint32_t)np;
+    }
+    return -1;
+}
+
 int gfx_msl_vs1(Sb* b, const GfxVsKey* k, const uint32_t* t)
 {
     if (!t || (t[0] & 0xFFFF0000u) != 0xFFFE0000u)
         return 0;
-    sb_printf(b, "vertex VOut vs_main(uint vid [[vertex_id]], constant U& u [[buffer(4)]]");
-    for (int s = 0; s < GFX_NSTREAMS; ++s)
-        sb_printf(b, ", device const uchar* s%d [[buffer(%d)]]", s, s);
-    gfx_msl_vs_params(b, k);
-    sb_printf(b, ") {\n  VOut o;\n  int vi = int(vid) + u.vofs.x;\n");
+    gfx_msl_vs_open(b, k);
+    sb_printf(b, "  int vi = int(vid) + u.vofs.x;\n");
     /* the inputs the declaration maps: v# is the declaration's register */
     for (int r = 0; r < GFX_NREGS; ++r)
     {

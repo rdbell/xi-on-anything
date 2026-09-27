@@ -140,7 +140,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1020,6 +1020,8 @@ static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_
         id<MTLFunction> vf = [lib newFunctionWithName:@"vs_main"], ff = [lib newFunctionWithName:@"fs_main"];
         if (k->lib.vs.shadow && !alpha_tested(&k->lib.fs)) /* depth alone: nothing for the fragments to do */
             [ff release], ff = nil;
+        if (k->lib.vs.capture) /* the triangles out to a buffer (rt_capture): nothing drawn */
+            [ff release], ff = nil, pd.rasterizationEnabled = NO;
         pd.vertexFunction = vf;
         pd.fragmentFunction = ff;
         pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
@@ -1492,7 +1494,7 @@ static void draw_encode(const GfxDraw* d)
             if (dw && g_rt->depth_world != dw)
                 [g_rt->depth_world release], g_rt->depth_world = [dw retain];
         }
-        Caster* rec = d->caster && g_fxs.fx != 0.0f && g_fxs.sun > 0.0f ? caster_new(d) : NULL;
+        Caster* rec = d->caster && g_fxs.fx != 0.0f && (g_fxs.sun > 0.0f || g_fxs.rt > 0.0f) ? caster_new(d) : NULL;
         if (rec)
             rec->ub = [buf retain], rec->uoff = off;
         for (int s = 0; s < GFX_NSTREAMS; ++s)
@@ -1764,7 +1766,8 @@ void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t c
  *
  * Settings: FFXI_FX=1 and FFXI_FX_<KEY> (the table in fx_config), then while the game runs
  * FFXI_FX_FILE (default ~/Library/Caches/FFXI/fx.txt), lines of key=value. debug shows one part
- * alone: 1 occlusion, 2 fog, 3 bloom, 4 god rays, 5 sun shadows (map and contact). light = 1 lights the world's
+ * alone: 1 occlusion, 2 fog, 3 bloom, 4 god rays, 5 sun shadows (map and contact), 6 the ray-traced scene
+ * (rt_frame). light = 1 lights the world's
  * lit draws per pixel rather than per vertex (gfx_msl.c). */
 static const char FX_MSL[] =
     "#include <metal_stdlib>\n"
@@ -1794,6 +1797,7 @@ static const char FX_MSL[] =
     "  float4x4 lmatn; // the near cascade: view space to its map\n"
     "  float4 smapn;  // its texel in world units, depth bias, penumbra, slope\n"
     "  float4 smapn2; // its depth units, 1 when it is there\n"
+    "  float4x4 vw;   // view space to the world (the ray tracing's)\n"
     "};\n"
     "struct FO { float4 pos [[position]]; float2 uv; };\n"
     "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
@@ -2060,7 +2064,8 @@ static const char FX_MSL[] =
     "fragment float4 fx_comp(FO in [[stage_in]], constant FxU& u [[buffer(0)]], texture2d<float> src [[texture(0)]],\n"
     "                        texture2d<float> ao [[texture(1)]], depth2d<float> dt [[texture(2)]],\n"
     "                        texture2d<float> b1 [[texture(3)]], texture2d<float> b2 [[texture(4)]],\n"
-    "                        texture2d<float> ry [[texture(5)]], sampler s [[sampler(0)]]) {\n"
+    "                        texture2d<float> ry [[texture(5)]], texture2d<float> rt [[texture(6)]],\n"
+    "                        sampler s [[sampler(0)]]) {\n"
     "  float2 px = in.pos.xy;\n"
     "  float4 c = src.read(uint2(px));\n"
     "  int dbg = int(u.grade.w);\n"
@@ -2068,6 +2073,7 @@ static const char FX_MSL[] =
     "  float o = os.x, sun = mix(1.0, os.y, u.smap.x) * mix(1.0, os.z, u.shadow.x);\n"
     "  if (dbg == 1) return float4(o, o, o, c.a);\n"
     "  if (dbg == 5) return float4(float3(sun), c.a);\n"
+    "  if (dbg == 6) return float4(rt.sample(s, in.uv).rgb, c.a);\n"
     "  c.rgb *= mix(1.0, o, u.ao.y) * sun;\n"
     "  float f = 0.0;\n"
     "  if (u.fogc.a > 0.0) {\n"
@@ -2107,7 +2113,7 @@ static const char FX_MSL[] =
 typedef struct FxU
 {
     float proj[4], zp[4], vp[4], size[4], ao[4], grade[4], hand[4], up[4], sun[4], suncol[4], sunuv[4], fogc[4], fogp[4],
-        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4];
+        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4], vw[16];
 } FxU;
 
 static struct
@@ -2202,6 +2208,11 @@ static const struct
     { "sun_near", offsetof(__typeof__(g_fxs), sun_near), 15.0f },
     { "temporal", offsetof(__typeof__(g_fxs), temporal), 0.85f },
     { "debug", offsetof(__typeof__(g_fxs), debug), 0.0f },
+    /* ray tracing through the scene's triangles (rt_frame): 0 off, 1 on */
+    { "rt", offsetof(__typeof__(g_fxs), rt), 0.0f },
+    /* how a fixed-function caster's triangles go back to the world: 1 through its own matrices (clip,
+     * object, view, world), 0 through the scene's camera like the vertex shaders' */
+    { "rt_proj", offsetof(__typeof__(g_fxs), rt_proj), 1.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -2272,7 +2283,8 @@ static void fx_config(void)
     const char* dbg = getenv("FFXI_FX_DEBUG"); /* also by name */
     if (dbg)
         g_fxs.debug = !strcmp(dbg, "ao") ? 1.0f : !strcmp(dbg, "fog") ? 2.0f : !strcmp(dbg, "bloom") ? 3.0f
-            : !strcmp(dbg, "rays") ? 4.0f : !strcmp(dbg, "shadow") ? 5.0f : (float)atof(dbg);
+            : !strcmp(dbg, "rays") ? 4.0f : !strcmp(dbg, "shadow") ? 5.0f
+            : !strcmp(dbg, "rt") ? 6.0f : (float)atof(dbg);
     const char* file = getenv("FFXI_FX_FILE");
     if (file && *file)
         snprintf(g_fx_file, sizeof g_fx_file, "%s", file);
@@ -2462,6 +2474,8 @@ static void cache_map_free(void)
     memset(&g_cache_map, 0, sizeof g_cache_map);
 }
 
+static void rt_forget(id<MTLBuffer> buf);
+
 static void cached_release(Cached* ce)
 {
     Caster* c = &ce->c;
@@ -2478,6 +2492,7 @@ static void sun_cache_forget(id<MTLBuffer> buf)
 {
     if (!buf)
         return;
+    rt_forget(buf);
     for (uint32_t i = 0; i < g_ncache; ++i)
     {
         Caster* c = &g_cache[i].c;
@@ -2788,6 +2803,768 @@ static int sun_map(const GfxScene* s, const float* L, FxU* u)
     return drawn != 0;
 }
 
+/* --- ray tracing (rt = 1) -------------------------------------------------------------------------------------
+ * The scene's casters as triangles, in acceleration structures the scene effects trace rays through
+ * (Metal ray tracing). A caster is run once more through its own vertex function with nothing drawn
+ * (the capture key, gfx_msl_vs_open): the position of each of its triangles' vertices goes out to a
+ * buffer, three a triangle, through a matrix from its clip space.
+ *
+ * A mesh the game keeps (a fixed caster whose transform is one matrix: the fixed function's wvp, or the
+ * four constants a vertex shader places its vertices with, gfx_msl_vs1_pos_consts) is captured once, in
+ * its own space, into a structure of its own. Each place it is drawn - that matrix through the camera's
+ * inverse, object to world - is an instance of it, kept for RT_KEEP frames after it was last drawn: the
+ * game draws only what the camera sees, and the zone behind the camera still casts. A zone's meshes are
+ * drawn many times each (rocks, trees, tiles of ground), and a door is one place that moves. The rest
+ * (characters, drawn from the frame's ring) is captured in the world every frame, into one structure.
+ * The instance structure over all of it is built every frame.
+ *
+ * debug = 6 shows the traced scene against the drawn one: the mesh a ray hits, in a tint of its own,
+ * where the hit agrees with the depth drawn; red where the ray hits nearer (a mesh kept where nothing
+ * is now), blue where it hits farther or nothing (a surface drawn that the structures lack), yellow
+ * where it hits something in the sky. */
+enum { RT_BUILDS = 256, RT_BUILD_TRIS = 400000 };
+
+static const char RT_MSL[] =
+    "#include <metal_raytracing>\n"
+    "using namespace raytracing;\n"
+    "static float3 rt_tint(uint i) {\n"
+    "  uint h = i * 2654435761u;\n"
+    "  return float3((h >> 8) & 255u, (h >> 16) & 255u, (h >> 24) & 255u) / 255.0 * 0.6 + 0.3;\n"
+    "}\n"
+    "kernel void rt_view(uint2 id [[thread_position_in_grid]], constant FxU& u [[buffer(0)]],\n"
+    "                    instance_acceleration_structure as [[buffer(1)]], depth2d<float> dt [[texture(0)]],\n"
+    "                    texture2d<float, access::write> out [[texture(1)]]) {\n"
+    "  uint2 sz = uint2(out.get_width(), out.get_height());\n"
+    "  if (id.x >= sz.x || id.y >= sz.y) return;\n"
+    "  float2 px = floor(u.vp.xy + (float2(id) + 0.5) * u.vp.zw / float2(sz)) + 0.5;\n"
+    "  float z = view_z(u, dt.read(uint2(px)));\n"
+    "  float dd = z != 0.0 ? length(view_pos(u, px, z)) : 0.0;\n"
+    "  float3 dv = normalize(view_pos(u, px, u.hand.x));\n"
+    "  ray r;\n"
+    "  r.origin = (u.vw * float4(0.0, 0.0, 0.0, 1.0)).xyz;\n"
+    "  r.direction = normalize((u.vw * float4(dv, 0.0)).xyz);\n"
+    "  r.min_distance = 0.0;\n"
+    "  r.max_distance = 1e5;\n"
+    "  intersector<triangle_data, instancing> x;\n"
+    "  x.assume_geometry_type(geometry_type::triangle);\n"
+    "  x.force_opacity(forced_opacity::opaque);\n"
+    "  intersector<triangle_data, instancing>::result_type h = x.intersect(r, as);\n"
+    "  float3 c = float3(0.0);\n"
+    "  if (h.type == intersection_type::none) c = dd > 0.0 ? float3(0.1, 0.3, 1.0) : float3(0.0);\n"
+    "  else if (dd <= 0.0) c = float3(1.0, 0.9, 0.1);\n"
+    "  else {\n"
+    "    float e = (h.distance - dd) / dd;\n"
+    "    c = e < -0.02 ? float3(1.0, 0.15, 0.1) : e > 0.02 ? float3(0.1, 0.3, 1.0) : rt_tint(h.instance_id + 1u);\n"
+    "  }\n"
+    "  out.write(float4(c, 1.0), id);\n"
+    "}\n";
+
+/* a mesh the game keeps (drawn from its own buffers): its triangles once, in its own space */
+typedef struct RtMesh
+{
+    Caster c; /* its buffers (retained); c.ub nil: the uniforms are a draw's, at its capture */
+    id<MTLBuffer> rtv;
+    id<MTLAccelerationStructure> blas;
+    uint32_t tris;
+    uint32_t nplace; /* the places it is drawn at */
+    uint64_t seen, tried;
+    int dead; /* a buffer it draws from changed or went: captured again when drawn again */
+    int none; /* no triangles to trace (lines, points) */
+    uint32_t at; /* its index among this frame's instance structures */
+} RtMesh;
+
+/* one place a mesh is drawn: its object space to the world (row vectors, as D3D) */
+typedef struct RtPlace
+{
+    uint32_t mesh;
+    float w[16];
+    uint64_t seen;
+    int32_t next; /* the next in its hash cell (rt_hash), -1 */
+} RtPlace;
+
+static struct
+{
+    int tried, ok;
+    id<MTLLibrary> lib;
+    id<MTLComputePipelineState> view_pipe;
+    id<MTLAccelerationStructure> tlas, dyn; /* this frame's */
+    NSArray* blas;                          /* what the instances point at (the tracing passes' useResources) */
+    id<MTLTexture> out;                     /* debug = 6 */
+    RtMesh* mesh;
+    uint32_t nmesh, cap_mesh;
+    Map map; /* CacheKey -> mesh index + 1 */
+    RtPlace* place;
+    uint32_t nplace, cap_place;
+    int32_t* head; /* places by mesh and whole world unit (rt_hash): the first in each cell, -1 */
+    uint32_t nhead;
+    uint64_t prev; /* the frame traced before this one (the world is not drawn every frame) */
+    float cam[3];
+    /* the vertex shaders' position transforms (gfx_msl_vs1_pos_consts), by shader */
+    uint32_t pos_prog[64];
+    int pos_k[64];
+    uint32_t npos;
+    /* the profile (FFXI_PROFILE) */
+    uint32_t nkept, kept_tris, ninst, moving_tris, built, waiting;
+    uint32_t pl_same, pl_moved, pl_new, pl_samefr; /* places matched as kept, moved, new; new beside one drawn this frame */
+    float pl_nd, pl_nt; /* a new place's nearest kept one: largest rotation difference, translation distance */
+} g_rtx;
+
+/* released once the GPU is past everything recorded so far (a structure an instance structure in flight
+ * may still point at) */
+static void rt_release_later(id o)
+{
+    if (!o)
+        return;
+    [cmd() addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        [o release];
+    }];
+}
+
+static int rt_init(void)
+{
+    if (g_rtx.tried)
+        return g_rtx.ok;
+    g_rtx.tried = 1;
+    if (![g_dev supportsRaytracing])
+    {
+        fprintf(stderr, "[recomp] gfx: ray tracing: not on this GPU\n");
+        return 0;
+    }
+    size_t a = strlen(FX_MSL), b = strlen(RT_MSL);
+    char* src = (char*)malloc(a + b + 1);
+    memcpy(src, FX_MSL, a), memcpy(src + a, RT_MSL, b + 1);
+    g_rtx.lib = compile(src);
+    free(src);
+    if (!g_rtx.lib)
+        return 0;
+    id<MTLFunction> f = [g_rtx.lib newFunctionWithName:@"rt_view"];
+    NSError* err = nil;
+    g_rtx.view_pipe = [g_dev newComputePipelineStateWithFunction:f error:&err];
+    [f release];
+    if (!g_rtx.view_pipe)
+    {
+        fprintf(stderr, "[recomp] gfx: ray tracing failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+        return 0;
+    }
+    g_rtx.ok = 1;
+    fprintf(stderr, "[recomp] gfx: ray tracing ready (%s)\n", [[g_dev name] UTF8String]);
+    return 1;
+}
+
+/* the vertex ids of a caster's triangles, three each (a strip's joins left out), into the frame's ring;
+ * how many (0: no triangles) */
+static uint32_t rt_ids(const Caster* c, id<MTLBuffer>* buf, NSUInteger* off)
+{
+    uint32_t ntri = c->prim == MTLPrimitiveTypeTriangle ? c->n / 3
+        : c->prim == MTLPrimitiveTypeTriangleStrip && c->n >= 3 ? c->n - 2 : 0;
+    if (!ntri)
+        return 0;
+    const uint8_t* ib = c->itype ? (const uint8_t*)[c->ib contents] + c->ioff : NULL;
+    uint32_t* ids = (uint32_t*)ring((size_t)ntri * 12, 16, buf, off);
+    uint32_t m = 0;
+    for (uint32_t t = 0; t < ntri; ++t)
+    {
+        uint32_t k[3];
+        for (int j = 0; j < 3; ++j)
+        {
+            uint32_t at = c->prim == MTLPrimitiveTypeTriangle ? 3 * t + j : t + j;
+            k[j] = !ib ? c->vstart + at : c->itype == 2 ? ((const uint16_t*)ib)[at] : ((const uint32_t*)ib)[at];
+        }
+        if (k[0] == k[1] || k[1] == k[2] || k[0] == k[2])
+            continue;
+        ids[m++] = k[0], ids[m++] = k[1], ids[m++] = k[2];
+    }
+    return m;
+}
+
+/* the caster's capture function: the position alone, as in the sun's map, so draws with one vertex
+ * layout share it; nil while it builds */
+static id<MTLRenderPipelineState> rt_pipeline(const Caster* cs)
+{
+    PipeKey pk;
+    memset(&pk, 0, sizeof pk);
+    pk.lib.vs = cs->lib.vs;
+    GfxVsKey* v = &pk.lib.vs;
+    v->capture = 1, v->shadow = 0, v->pixel = 0;
+    v->lighting = v->normalize = v->localviewer = v->specular = 0;
+    v->src_diffuse = v->src_specular = v->src_ambient = v->src_emissive = 0;
+    v->nlights = 0, memset(v->light_type, 0, sizeof v->light_type);
+    v->fog_vertex = v->range_fog = 0, v->ntex = 0, v->flat = 0;
+    memset(v->tci, 0, sizeof v->tci), memset(v->ttf, 0, sizeof v->ttf);
+    return pipeline_for(&pk, cs->vs, NULL);
+}
+
+static void rt_capture(id<MTLRenderCommandEncoder> e, id<MTLRenderPipelineState> p, const Caster* cs, const float* clip_world,
+    id<MTLBuffer> ids, NSUInteger ids_off, uint32_t m, id<MTLBuffer> out, NSUInteger out_off)
+{
+    [e setRenderPipelineState:p];
+    for (int st = 0; st < GFX_NSTREAMS; ++st)
+        [e setVertexBuffer:cs->vb[st] offset:cs->voff[st] atIndex:(NSUInteger)st];
+    [e setVertexBuffer:cs->ub offset:cs->uoff atIndex:4];
+    [e setVertexBytes:clip_world length:64 atIndex:5];
+    [e setVertexBuffer:out offset:out_off atIndex:6];
+    [e setVertexBuffer:ids offset:ids_off atIndex:7];
+    [e drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:m];
+}
+
+/* what takes a caster's clip-space positions to the world: for the fixed function (rt_proj 1) its own
+ * matrices, clip space back through wvp to the object, then out through wv and the camera to the world -
+ * whatever projection it was drawn with; else the scene camera's inverse (clip_world) */
+static void rt_matrix(const Caster* c, const float* clip_world, const float* view_world, float* out)
+{
+    memcpy(out, clip_world, 64);
+    if (c->lib.vs.prog || g_fxs.rt_proj == 0.0f || !c->ub)
+        return;
+    const GfxU* u = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
+    float iwvp[16], t[16];
+    if (mat_inverse(iwvp, u->wvp))
+        mat_mul(t, iwvp, u->wv), mat_mul(out, t, view_world);
+}
+
+/* the profile: the projections the fixed-function casters were drawn with, against the scene's */
+static void rt_projections(const float* proj)
+{
+    static double last;
+    double now = CACurrentMediaTime();
+    if (now - last < 2.0)
+        return;
+    last = now;
+    float seen[8][4];
+    uint32_t count[8] = { 0 }, nseen = 0, prog = 0, fixed = 0, moving = 0;
+    for (uint32_t i = 0; i < g_ncasters; ++i)
+    {
+        const Caster* c = &g_casters[i];
+        c->fixed ? fixed++ : moving++;
+        if (c->lib.vs.prog)
+        {
+            prog++;
+            continue;
+        }
+        const GfxU* u = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
+        float iwv[16], P[16];
+        if (!mat_inverse(iwv, u->wv))
+            continue;
+        mat_mul(P, iwv, u->wvp);
+        float k[4] = { P[0], P[5], P[10], P[14] };
+        uint32_t j = 0;
+        for (; j < nseen; ++j)
+            if (fabsf(seen[j][0] - k[0]) < 1e-3f && fabsf(seen[j][1] - k[1]) < 1e-3f && fabsf(seen[j][2] - k[2]) < 1e-3f &&
+                fabsf(seen[j][3] - k[3]) < 1e-3f)
+                break;
+        if (j == nseen && nseen < 8)
+            memcpy(seen[nseen++], k, 16);
+        if (j < 8)
+            count[j]++;
+    }
+    fprintf(stderr, "[recomp] gfx: rt: scene projection P00 %.4f P11 %.4f P22 %.4f P32 %.4f (P20 %.4f P21 %.4f P23 %.1f); casters %u "
+        "(%u fixed, %u moving, %u vertex shaders)\n", proj[0], proj[5], proj[10], proj[14], proj[8], proj[9], proj[11],
+        g_ncasters, fixed, moving, prog);
+    for (uint32_t j = 0; j < nseen; ++j)
+        fprintf(stderr, "[recomp] gfx: rt:   drawn with P00 %.4f P11 %.4f P22 %.4f P32 %.4f: %u casters\n", seen[j][0], seen[j][1],
+            seen[j][2], seen[j][3], count[j]);
+}
+
+static MTLPrimitiveAccelerationStructureDescriptor* rt_blas_desc(id<MTLBuffer> v, NSUInteger off, uint32_t ntri)
+{
+    MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+    g.vertexBuffer = v, g.vertexBufferOffset = off, g.vertexStride = 16, g.triangleCount = ntri, g.opaque = YES;
+    MTLPrimitiveAccelerationStructureDescriptor* d = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    d.geometryDescriptors = @[ g ];
+    return d;
+}
+
+enum { RT_KEEP = 60 * 30 }; /* frames a place is kept after it was last drawn */
+
+static void rt_map_free(void)
+{
+    for (uint32_t i = 0; i < g_rtx.map.cap; ++i)
+        if (g_rtx.map.e[i].hash)
+            free(g_rtx.map.e[i].key);
+    free(g_rtx.map.e);
+    memset(&g_rtx.map, 0, sizeof g_rtx.map);
+}
+
+static void rt_mesh_release(RtMesh* me)
+{
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        [me->c.vb[s] release];
+    [me->c.ib release];
+    rt_release_later(me->rtv), rt_release_later(me->blas);
+}
+
+/* a buffer the game changed or let go of: the meshes drawn from it are captured again if drawn again */
+static void rt_forget(id<MTLBuffer> buf)
+{
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+    {
+        Caster* c = &g_rtx.mesh[i].c;
+        int hit = c->ib == buf;
+        for (int s = 0; s < GFX_NSTREAMS; ++s)
+            hit |= c->vb[s] == buf;
+        if (hit)
+            g_rtx.mesh[i].dead = 1;
+    }
+}
+
+/* keeps the places drawn in the last RT_KEEP frames (none when all) and the meshes they use, and
+ * builds the lookups again */
+static void rt_trim(int all)
+{
+    uint32_t* remap = (uint32_t*)malloc((g_rtx.nmesh + 1) * sizeof *remap);
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+        g_rtx.mesh[i].nplace = 0;
+    uint32_t np = 0;
+    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+    {
+        RtPlace* p = &g_rtx.place[i];
+        if (!all && p->seen + RT_KEEP >= g_serial)
+            g_rtx.place[np++] = *p, g_rtx.mesh[p->mesh].nplace++;
+    }
+    g_rtx.nplace = np;
+    uint32_t nm = 0;
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+    {
+        RtMesh* me = &g_rtx.mesh[i];
+        if (all || (!me->nplace && me->seen + RT_KEEP < g_serial))
+        {
+            rt_mesh_release(me);
+            remap[i] = UINT32_MAX;
+            continue;
+        }
+        remap[i] = nm;
+        g_rtx.mesh[nm++] = *me;
+    }
+    g_rtx.nmesh = nm;
+    rt_map_free();
+    for (uint32_t i = 0; i < nm; ++i)
+    {
+        RtMesh* me = &g_rtx.mesh[i];
+        me->nplace = 0;
+        CacheKey k;
+        cache_key(&k, &me->c);
+        map_put(&g_rtx.map, &k, sizeof k, (id)(uintptr_t)(i + 1));
+    }
+    for (uint32_t i = 0; i < np; ++i)
+    {
+        RtPlace* p = &g_rtx.place[i];
+        p->mesh = remap[p->mesh];
+        g_rtx.mesh[p->mesh].nplace++;
+    }
+    free(remap);
+}
+
+/* the caster's object space to its clip space (row vectors): the fixed function's wvp, or the four
+ * constants a vertex shader's position transform reads; 0 when it is not one matrix */
+static int rt_wvp(const Caster* c, float* out)
+{
+    const GfxU* u = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
+    if (!c->lib.vs.prog)
+    {
+        memcpy(out, u->wvp, 64);
+        return 1;
+    }
+    int k = -1;
+    uint32_t i = 0;
+    for (; i < g_rtx.npos; ++i)
+        if (g_rtx.pos_prog[i] == c->lib.vs.prog)
+            break;
+    if (i < g_rtx.npos)
+        k = g_rtx.pos_k[i];
+    else
+    {
+        k = gfx_msl_vs1_pos_consts(c->vs);
+        if (g_rtx.npos < 64)
+            g_rtx.pos_prog[g_rtx.npos] = c->lib.vs.prog, g_rtx.pos_k[g_rtx.npos++] = k;
+        fprintf(stderr, "[recomp] gfx: rt: vertex shader %08x places its vertices %s%d\n", c->lib.vs.prog,
+            k >= 0 ? "through c" : "some other way ", k);
+    }
+    if (k < 0 || k + 3 >= GFX_NVSC)
+        return 0;
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 4; ++col)
+            out[r * 4 + col] = u->vsc[k + col][r];
+    return 1;
+}
+
+static uint32_t rt_cell(uint32_t m, int x, int y, int z)
+{
+    uint32_t h = m * 0x9E3779B1u ^ (uint32_t)x * 0x85EBCA77u ^ (uint32_t)y * 0xC2B2AE3Du ^ (uint32_t)z * 0x27D4EB2Fu;
+    return (h ^ (h >> 15)) & (g_rtx.nhead - 1);
+}
+
+static void rt_hash_add(uint32_t i)
+{
+    RtPlace* p = &g_rtx.place[i];
+    uint32_t c = rt_cell(p->mesh, (int)floorf(p->w[12]), (int)floorf(p->w[13]), (int)floorf(p->w[14]));
+    p->next = g_rtx.head[c], g_rtx.head[c] = (int32_t)i;
+}
+
+/* the places by cell, again (a place that moved is found in its new one); room for twice as many */
+static void rt_hash(void)
+{
+    uint32_t want = 1024;
+    while (want < 4 * (g_rtx.nplace + 4096))
+        want *= 2;
+    if (want != g_rtx.nhead)
+        g_rtx.nhead = want, g_rtx.head = (int32_t*)realloc(g_rtx.head, want * sizeof *g_rtx.head);
+    memset(g_rtx.head, 0xFF, g_rtx.nhead * sizeof *g_rtx.head);
+    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+        rt_hash_add(i);
+}
+
+/* where this frame's draw of mesh m (object to world w) is: a place already kept there, one drawn the
+ * frame traced before that has since moved a little (a door opening), or a new one */
+static void rt_place(uint32_t m, const float* w)
+{
+    RtMesh* me = &g_rtx.mesh[m];
+    int moved = -1;
+    float best = 0.25f, nd = 1e9f, nt = 1e9f;
+    int cx = (int)floorf(w[12]), cy = (int)floorf(w[13]), cz = (int)floorf(w[14]);
+    for (int k = 0; k < 27; ++k)
+    {
+        int x = cx + k % 3 - 1, y = cy + (k / 3) % 3 - 1, z = cz + k / 9 - 1;
+        uint32_t c = rt_cell(m, x, y, z);
+        for (int32_t i = g_rtx.head[c]; i >= 0; i = g_rtx.place[i].next)
+        {
+            RtPlace* p = &g_rtx.place[i];
+            if (p->mesh != m)
+                continue;
+            float d = 0.0f;
+            for (int j = 0; j < 12; ++j)
+                d = fmaxf(d, fabsf(p->w[j] - w[j]) * ((j & 3) == 3 ? 0.0f : 1.0f));
+            float dx = p->w[12] - w[12], dy = p->w[13] - w[13], dz = p->w[14] - w[14], t = dx * dx + dy * dy + dz * dz;
+            if (t < nt)
+                nt = t, nd = d;
+            /* placed already this frame, near enough: the same mesh drawn again there (another pass, a
+             * second target drawn with the camera a moment apart) */
+            if (p->seen == g_serial)
+            {
+                if (d < 1e-2f && t < 0.25f)
+                {
+                    g_rtx.pl_samefr++;
+                    return;
+                }
+                continue;
+            }
+            if (d < 1e-2f && t < best)
+                best = t, moved = i;
+        }
+    }
+    /* the nearest place kept: as it was when near enough (the camera's matrices and the game's can be
+     * a frame apart while it turns, and every place would wobble with it), else moved there (a door) */
+    if (moved >= 0)
+    {
+        RtPlace* p = &g_rtx.place[moved];
+        p->seen = g_serial;
+        if (best > 0.01f)
+            memcpy(p->w, w, 64), g_rtx.pl_moved++;
+        else
+            g_rtx.pl_same++;
+        return;
+    }
+    g_rtx.pl_new++;
+    if (nt < 1e9f)
+        g_rtx.pl_nd = nd, g_rtx.pl_nt = sqrtf(nt);
+    if (g_rtx.nplace == g_rtx.cap_place)
+        g_rtx.cap_place = g_rtx.cap_place ? g_rtx.cap_place * 2 : 1024,
+        g_rtx.place = (RtPlace*)realloc(g_rtx.place, g_rtx.cap_place * sizeof *g_rtx.place);
+    RtPlace* p = &g_rtx.place[g_rtx.nplace];
+    p->mesh = m, p->seen = g_serial;
+    memcpy(p->w, w, 64);
+    me->nplace++;
+    if (4 * (g_rtx.nplace + 1) > g_rtx.nhead) /* the table's too full: bigger, with every place again */
+        g_rtx.nplace++, rt_hash();
+    else
+        rt_hash_add(g_rtx.nplace++);
+}
+
+/* the mesh a fixed caster draws, kept from before or new */
+static uint32_t rt_mesh(const Caster* c)
+{
+    CacheKey k;
+    cache_key(&k, c);
+    uintptr_t at = (uintptr_t)map_get(&g_rtx.map, &k, sizeof k);
+    if (at)
+    {
+        RtMesh* me = &g_rtx.mesh[at - 1];
+        if (me->dead) /* new contents: captured again */
+        {
+            rt_release_later(me->rtv), rt_release_later(me->blas);
+            me->rtv = nil, me->blas = nil, me->dead = 0, me->none = 0;
+        }
+        return (uint32_t)(at - 1);
+    }
+    if (g_rtx.nmesh == g_rtx.cap_mesh)
+        g_rtx.cap_mesh = g_rtx.cap_mesh ? g_rtx.cap_mesh * 2 : 1024,
+        g_rtx.mesh = (RtMesh*)realloc(g_rtx.mesh, g_rtx.cap_mesh * sizeof *g_rtx.mesh);
+    RtMesh* me = &g_rtx.mesh[g_rtx.nmesh];
+    memset(me, 0, sizeof *me);
+    me->c = *c;
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        [me->c.vb[s] retain];
+    [me->c.ib retain];
+    me->c.ub = nil;
+    memset(me->c.tex, 0, sizeof me->c.tex);
+    map_put(&g_rtx.map, &k, sizeof k, (id)(uintptr_t)(g_rtx.nmesh + 1));
+    return g_rtx.nmesh++;
+}
+
+/* The structures for this frame's scene (camera: clip_world, its view to the world view_world); 0 when
+ * there is nothing to trace. Each fixed caster places its mesh (object space to the world: its own
+ * transform through the camera's inverse); a mesh new to it is captured in its own space (clip space
+ * back through the inverse of that transform). The rest - what moves, or a shader that places its
+ * vertices some other way - is captured in the world, every frame. */
+static int rt_frame(const float* clip_world, const float* view_world, const float* proj)
+{
+    if (!rt_init())
+        return 0;
+    if (gfx_profiling)
+        rt_projections(proj);
+    const float* cam = view_world + 12;
+    float jx = cam[0] - g_rtx.cam[0], jy = cam[1] - g_rtx.cam[1], jz = cam[2] - g_rtx.cam[2];
+    if (jx * jx + jy * jy + jz * jz > 50.0f * 50.0f) /* a new zone */
+        rt_trim(1);
+    memcpy(g_rtx.cam, cam, 12);
+    if (!(g_serial & 127))
+        rt_trim(0);
+    rt_hash();
+    typedef struct
+    {
+        const Caster* c;
+        uint32_t mi; /* the mesh, or UINT32_MAX: in the world, with the frame's moving structure */
+        id<MTLRenderPipelineState> p;
+        id<MTLBuffer> ids;
+        NSUInteger ids_off;
+        uint32_t m;
+        float sm[16];
+    } Job;
+    Job* jobs = (Job*)malloc(((size_t)g_ncasters + 1) * sizeof(Job));
+    uint32_t njobs = 0, dyn_verts = 0, tris = 0;
+    g_rtx.waiting = 0;
+    for (uint32_t i = 0; i < g_ncasters; ++i)
+    {
+        const Caster* c = &g_casters[i];
+        float wvp[16], w[16], inv[16];
+        int placed = 0;
+        if (c->fixed && rt_wvp(c, wvp) && mat_inverse(inv, wvp))
+        {
+            mat_mul(w, wvp, clip_world);
+            /* one matrix from the object to the world (no projection left in it) */
+            if (fabsf(w[15]) > 1e-6f)
+            {
+                float k = 1.0f / w[15];
+                for (int j = 0; j < 16; ++j)
+                    w[j] *= k;
+                placed = fabsf(w[3]) + fabsf(w[7]) + fabsf(w[11]) < 1e-3f;
+            }
+        }
+        RtMesh* me = NULL;
+        uint32_t mi = UINT32_MAX;
+        if (placed)
+        {
+            mi = rt_mesh(c);
+            rt_place(mi, w);
+            me = &g_rtx.mesh[mi];
+            me->seen = g_serial;
+            if (me->blas || me->none || me->tried == g_serial)
+                continue;
+            if (njobs >= RT_BUILDS || tris >= RT_BUILD_TRIS)
+            {
+                g_rtx.waiting++;
+                continue;
+            }
+        }
+        id<MTLRenderPipelineState> p = rt_pipeline(c);
+        if (!p)
+        {
+            g_rtx.waiting += me != NULL;
+            continue;
+        }
+        Job* j = &jobs[njobs];
+        j->m = rt_ids(c, &j->ids, &j->ids_off);
+        if (!j->m)
+        {
+            if (me)
+                me->none = 1;
+            continue;
+        }
+        j->c = c, j->mi = mi, j->p = p;
+        if (me)
+            me->tried = g_serial, memcpy(j->sm, inv, 64), tris += j->m / 3;
+        else
+            rt_matrix(c, clip_world, view_world, j->sm), dyn_verts += j->m;
+        njobs++;
+    }
+    /* the triangles out */
+    id<MTLBuffer> dyn_buf = nil;
+    NSUInteger dyn_off = 0;
+    uint32_t nstatic = 0;
+    if (njobs)
+    {
+        if (dyn_verts)
+            ring((size_t)dyn_verts * 16, 16, &dyn_buf, &dyn_off);
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.renderTargetWidth = 1, rp.renderTargetHeight = 1, rp.defaultRasterSampleCount = 1;
+        id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+        NSUInteger at = dyn_off;
+        for (uint32_t i = 0; i < njobs; ++i)
+        {
+            Job* j = &jobs[i];
+            if (j->mi != UINT32_MAX)
+            {
+                RtMesh* me = &g_rtx.mesh[j->mi];
+                me->rtv = [g_dev newBufferWithLength:(NSUInteger)j->m * 16 options:MTLResourceStorageModePrivate];
+                rt_capture(e, j->p, j->c, j->sm, j->ids, j->ids_off, j->m, me->rtv, 0);
+                jobs[nstatic++] = *j; /* the meshes first, in order (the moving ones are all in dyn_buf) */
+            }
+            else
+            {
+                rt_capture(e, j->p, j->c, j->sm, j->ids, j->ids_off, j->m, dyn_buf, at);
+                at += (NSUInteger)j->m * 16;
+            }
+        }
+        [e endEncoding];
+    }
+    /* their structures: one for each mesh captured, one for what moves */
+    uint32_t nb = nstatic + (dyn_verts ? 1 : 0);
+    rt_release_later(g_rtx.dyn), g_rtx.dyn = nil;
+    if (nb)
+    {
+        MTLPrimitiveAccelerationStructureDescriptor** desc = malloc(nb * sizeof *desc);
+        id<MTLAccelerationStructure>* as = malloc(nb * sizeof *as);
+        NSUInteger* soff = malloc(nb * sizeof *soff), scratch = 0;
+        for (uint32_t i = 0; i < nb; ++i)
+        {
+            desc[i] = i < nstatic ? rt_blas_desc(g_rtx.mesh[jobs[i].mi].rtv, 0, jobs[i].m / 3) : rt_blas_desc(dyn_buf, dyn_off, dyn_verts / 3);
+            MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:desc[i]];
+            as[i] = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+            soff[i] = scratch, scratch += (sz.buildScratchBufferSize + 255) & ~(NSUInteger)255;
+        }
+        id<MTLBuffer> sb = [g_dev newBufferWithLength:scratch ? scratch : 256 options:MTLResourceStorageModePrivate];
+        id<MTLAccelerationStructureCommandEncoder> e = [cmd() accelerationStructureCommandEncoder];
+        for (uint32_t i = 0; i < nb; ++i)
+            if (as[i])
+                [e buildAccelerationStructure:as[i] descriptor:desc[i] scratchBuffer:sb scratchBufferOffset:soff[i]];
+        [e endEncoding];
+        [sb release]; /* the command buffer holds it until it is done */
+        for (uint32_t i = 0; i < nstatic; ++i)
+        {
+            RtMesh* me = &g_rtx.mesh[jobs[i].mi];
+            me->blas = as[i], me->tris = jobs[i].m / 3;
+            if (!as[i]) /* no room: captured again when drawn again */
+                rt_release_later(me->rtv), me->rtv = nil;
+        }
+        if (dyn_verts)
+            g_rtx.dyn = as[nstatic];
+        free(desc), free(as), free(soff);
+    }
+    g_rtx.built = nstatic;
+    g_rtx.prev = g_serial;
+    free(jobs);
+    /* the instances: every place kept whose mesh has a structure, and what moves */
+    NSMutableArray* list = [NSMutableArray arrayWithCapacity:g_rtx.nmesh + 1];
+    g_rtx.nkept = g_rtx.kept_tris = 0;
+    for (uint32_t i = 0; i < g_rtx.nmesh; ++i)
+    {
+        RtMesh* me = &g_rtx.mesh[i];
+        me->at = UINT32_MAX;
+        if (!me->dead && me->blas && me->nplace)
+            me->at = (uint32_t)list.count, [list addObject:me->blas], g_rtx.nkept++;
+    }
+    uint32_t ninst = 0;
+    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+        ninst += g_rtx.place[i].seen + RT_KEEP >= g_serial && g_rtx.mesh[g_rtx.place[i].mesh].at != UINT32_MAX;
+    g_rtx.moving_tris = dyn_verts / 3;
+    uint32_t dyn_at = (uint32_t)list.count;
+    if (g_rtx.dyn)
+        [list addObject:g_rtx.dyn], ninst++;
+    g_rtx.ninst = ninst;
+    rt_release_later(g_rtx.tlas), g_rtx.tlas = nil;
+    [g_rtx.blas release], g_rtx.blas = nil;
+    if (!ninst)
+        return 0;
+    id<MTLBuffer> ib;
+    NSUInteger ioff;
+    MTLAccelerationStructureInstanceDescriptor* inst =
+        (MTLAccelerationStructureInstanceDescriptor*)ring(ninst * sizeof *inst, 16, &ib, &ioff);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_rtx.nplace; ++i)
+    {
+        RtPlace* p = &g_rtx.place[i];
+        RtMesh* me = &g_rtx.mesh[p->mesh];
+        if (p->seen + RT_KEEP < g_serial || me->at == UINT32_MAX)
+            continue;
+        memset(&inst[n], 0, sizeof inst[n]);
+        /* column j of the (column-vector) transform is row j of the row-vector one */
+        for (int j = 0; j < 4; ++j)
+        {
+            inst[n].transformationMatrix.columns[j].x = p->w[4 * j];
+            inst[n].transformationMatrix.columns[j].y = p->w[4 * j + 1];
+            inst[n].transformationMatrix.columns[j].z = p->w[4 * j + 2];
+        }
+        inst[n].options = MTLAccelerationStructureInstanceOptionOpaque;
+        inst[n].mask = 0xFF;
+        inst[n].accelerationStructureIndex = me->at;
+        g_rtx.kept_tris += me->tris;
+        n++;
+    }
+    if (g_rtx.dyn)
+    {
+        memset(&inst[n], 0, sizeof inst[n]);
+        inst[n].transformationMatrix.columns[0].x = 1.0f;
+        inst[n].transformationMatrix.columns[1].y = 1.0f;
+        inst[n].transformationMatrix.columns[2].z = 1.0f;
+        inst[n].options = MTLAccelerationStructureInstanceOptionOpaque;
+        inst[n].mask = 0xFF;
+        inst[n].accelerationStructureIndex = dyn_at;
+        n++;
+    }
+    MTLInstanceAccelerationStructureDescriptor* td = [MTLInstanceAccelerationStructureDescriptor descriptor];
+    td.instancedAccelerationStructures = list;
+    td.instanceCount = n;
+    td.instanceDescriptorBuffer = ib;
+    td.instanceDescriptorBufferOffset = ioff;
+    MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:td];
+    g_rtx.tlas = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+    id<MTLBuffer> sb = [g_dev newBufferWithLength:sz.buildScratchBufferSize ? sz.buildScratchBufferSize : 256
+                                          options:MTLResourceStorageModePrivate];
+    id<MTLAccelerationStructureCommandEncoder> e = [cmd() accelerationStructureCommandEncoder];
+    [e buildAccelerationStructure:g_rtx.tlas descriptor:td scratchBuffer:sb scratchBufferOffset:0];
+    [e endEncoding];
+    [sb release];
+    g_rtx.blas = [list retain];
+    return g_rtx.tlas != nil;
+}
+
+/* the traced scene against the drawn one (debug = 6), at w x h */
+static id<MTLTexture> rt_view(const FxU* u, id<MTLTexture> depth, NSUInteger w, NSUInteger h)
+{
+    if (!g_rtx.out || g_rtx.out.width != w || g_rtx.out.height != h)
+    {
+        [g_rtx.out release];
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:w height:h mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        g_rtx.out = [g_dev newTextureWithDescriptor:d];
+    }
+    NSUInteger n = g_rtx.blas.count;
+    id<MTLResource>* r = (id<MTLResource>*)malloc((n ? n : 1) * sizeof *r);
+    [g_rtx.blas getObjects:r range:NSMakeRange(0, n)];
+    id<MTLComputeCommandEncoder> e = [cmd() computeCommandEncoder];
+    [e setComputePipelineState:g_rtx.view_pipe];
+    [e setBytes:u length:sizeof *u atIndex:0];
+    [e setAccelerationStructure:g_rtx.tlas atBufferIndex:1];
+    [e useResources:r count:n usage:MTLResourceUsageRead];
+    [e setTexture:depth atIndex:0];
+    [e setTexture:g_rtx.out atIndex:1];
+    [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [e endEncoding];
+    free(r);
+    return g_rtx.out;
+}
+
 void gfx_trace_dump(const char* path)
 {
     FILE* f = fopen(path, "w");
@@ -2957,6 +3734,15 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 if (mat_inverse(vinv2, s->view))
                     memcpy(g_fx.prev_cam, vinv2 + 12, 12);
             }
+            /* the ray tracing's structures, for this frame's camera */
+            int traced = 0;
+            if (g_fxs.rt > 0.0f && have_v)
+            {
+                float invP[16], cw[16];
+                memcpy(u.vw, vinv, 64);
+                if (mat_inverse(invP, s->proj))
+                    mat_mul(cw, invP, vinv), traced = rt_frame(cw, vinv, s->proj);
+            }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
             u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
             if (fx_tex(&g_fx.src, ct.pixelFormat, ct.width, ct.height) && fx_tex(&g_fx.ao0, MTLPixelFormatRGBA16Float, aw, ah) &&
@@ -3015,8 +3801,9 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                         fx_pass(g_fx.ra, MTLLoadActionDontCare, g_fx.gauss_pipe, qb, &u, &g_fx.rb, 1, across);
                         fx_pass(g_fx.rb, MTLLoadActionDontCare, g_fx.gauss_pipe, qb, &u, &g_fx.ra, 1, down);
                     }
-                    id<MTLTexture> comp_in[6] = { g_fx.src, ao_out, depth, g_fx.b1a, g_fx.b2a, g_fx.rb };
-                    fx_pass(ct, MTLLoadActionLoad, g_fx.comp_pipe, (MTLViewport){ vx, vy, vw, vh, 0, 1 }, &u, comp_in, 6, NULL);
+                    id<MTLTexture> rt_out = traced && g_fxs.debug == 6.0f ? rt_view(&u, depth, aw, ah) : nil;
+                    id<MTLTexture> comp_in[7] = { g_fx.src, ao_out, depth, g_fx.b1a, g_fx.b2a, g_fx.rb, rt_out ? rt_out : g_fx.src };
+                    fx_pass(ct, MTLLoadActionLoad, g_fx.comp_pipe, (MTLViewport){ vx, vy, vw, vh, 0, 1 }, &u, comp_in, 7, NULL);
                 }
             }
         }
@@ -3036,6 +3823,15 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 fprintf(stderr, "[recomp] gfx: shadows: %u frames, %u with the sun's own light, %u with a map; casters %u..%u; "
                     "%u cached; map %.0f units across; sun %.2f %.2f %.2f\n", g_fx.st_frames, g_fx.st_own, g_fx.st_map, g_fx.st_cmin,
                     g_fx.st_cmax, g_fx.st_cached, g_fx.st_across, g_fx.sunw[0], g_fx.sunw[1], g_fx.sunw[2]);
+                if (g_fxs.rt > 0.0f && g_rtx.ok)
+                    fprintf(stderr, "[recomp] gfx: rt: %u meshes, %u instances (%u triangles), %u moving triangles, %u built "
+                        "this frame, %u waiting\n", g_rtx.nkept, g_rtx.ninst, g_rtx.kept_tris, g_rtx.moving_tris, g_rtx.built,
+                        g_rtx.waiting);
+                if (g_fxs.rt > 0.0f && g_rtx.ok)
+                    fprintf(stderr, "[recomp] gfx: rt: places: %u as kept, %u moved, %u new, %u drawn again; "
+                        "a new one's nearest: %.5f rotation, %.4f units\n", g_rtx.pl_same, g_rtx.pl_moved, g_rtx.pl_new,
+                        g_rtx.pl_samefr, g_rtx.pl_nd, g_rtx.pl_nt),
+                    g_rtx.pl_same = g_rtx.pl_moved = g_rtx.pl_new = g_rtx.pl_samefr = 0;
                 last = now, g_fx.st_frames = g_fx.st_own = g_fx.st_map = g_fx.st_cmax = 0;
             }
         }

@@ -136,15 +136,31 @@ static int elem_components(uint8_t type)
 
 /* drawn from the sun: whatever clip-space position the function makes (the camera's, from the
  * transforms or a vertex shader's constants) goes on through the camera's inverse into the sun's
- * view - one matrix, so any draw of the scene can be drawn again into the shadow map */
-void gfx_msl_vs_params(Sb* b, const GfxVsKey* k)
+ * view - one matrix, so any draw of the scene can be drawn again into the shadow map. Captured (ray
+ * tracing): the same matrix takes it to the world, and it is written out, one per entry of the list
+ * of vertex ids - a draw's triangles, three vertices each. */
+void gfx_msl_vs_open(Sb* b, const GfxVsKey* k)
 {
-    if (k->shadow)
+    sb_printf(b, "vertex %s vs_main(uint %s [[vertex_id]], constant U& u [[buffer(4)]]", k->capture ? "void" : "VOut",
+        k->capture ? "cid" : "vid");
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        sb_printf(b, ", device const uchar* s%d [[buffer(%d)]]", s, s);
+    if (k->shadow || k->capture)
         sb_printf(b, ", constant float4x4& sm [[buffer(5)]]");
+    if (k->capture)
+        sb_printf(b, ", device float4* cap [[buffer(6)]], device const uint* cidx [[buffer(7)]]");
+    sb_printf(b, ") {\n  VOut o;\n");
+    if (k->capture)
+        sb_printf(b, "  uint vid = cidx[cid];\n");
 }
 
 void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
 {
+    if (k->capture)
+    {
+        sb_printf(b, "  float4 w = sm * o.pos;\n  cap[cid] = float4(w.xyz / w.w, 1.0);\n  return;\n}\n");
+        return;
+    }
     if (k->shadow)
         sb_printf(b, "  o.pos = sm * o.pos;\n");
     sb_printf(b, "  return o;\n}\n");
@@ -152,11 +168,8 @@ void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
 
 static void emit_vs_signature(Sb* b, const GfxVsKey* k)
 {
-    sb_printf(b, "vertex VOut vs_main(uint vid [[vertex_id]], constant U& u [[buffer(4)]]");
-    for (int s = 0; s < GFX_NSTREAMS; ++s)
-        sb_printf(b, ", device const uchar* s%d [[buffer(%d)]]", s, s);
-    gfx_msl_vs_params(b, k);
-    sb_printf(b, ") {\n  VOut o;\n  int vi = int(vid) + u.vofs.x;\n  o.psize = 1.0;\n");
+    gfx_msl_vs_open(b, k);
+    sb_printf(b, "  int vi = int(vid) + u.vofs.x;\n  o.psize = 1.0;\n");
 }
 
 /* clip-space position fixup: D3D's pixel centers onto Metal's */

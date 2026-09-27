@@ -98,7 +98,9 @@ typedef struct GfxVsKey
                          * scene effects' light setting); the vertex function passes the normal on */
     uint8_t shadow;     /* drawn again from the sun (the back end's shadow map): the position the
                          * function makes goes through the matrix in buffer 5 */
-    uint8_t pad[1];
+    uint8_t capture;    /* run once more with nothing drawn (the back end's ray tracing): the vertex
+                         * ids come from the list in buffer 7, and the position the function makes,
+                         * through the matrix in buffer 5, goes to buffer 6 at the list's place */
 } GfxVsKey;
 
 typedef struct GfxStage
