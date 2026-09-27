@@ -197,6 +197,8 @@ typedef struct GfxDraw
     uint8_t caster; /* 1: an opaque draw of the frame's 3D scene: it casts the sun's shadow; 2: one of the
                      * world's drawn after the scene's effects ran (characters, some frames): traced
                      * with the next frame's scene (the back end's ray tracing), no shadow map */
+    uint8_t receive; /* the world's own (the zone's shaders, or fogged) in its scene, blended ones too -
+                      * its decals: the sun's shadow falls on it */
     uint8_t fill;   /* D3DFILLMODE */
     int32_t zbias;  /* D3DRS_ZBIAS */
     uint32_t stencil_ref;

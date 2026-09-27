@@ -19,6 +19,11 @@
 #include "gfx.h"
 #include "gfx_msl.h"
 
+/* traced with the vertex's own normal (gfx_msl_generate): the world's normal passed on (VOut.wn), from
+ * the object's space through the position transform - u.wvp, or a vs.1.x shader's constants from
+ * g_rt_pos (-1: fixed function) - and the draw's camera back to the world */
+static int g_rt_wn, g_rt_pos;
+
 _Static_assert(sizeof(GfxU) == 3536, "GfxU must match the MSL struct U");
 
 void sb_printf(Sb* b, const char* fmt, ...)
@@ -88,7 +93,7 @@ static void emit_vout(Sb* b, const GfxVsKey* k)
     for (int i = 0; i < ntex; ++i)
         sb_printf(b, "  float4 t%d [[user(t%d)]];\n", i, i);
     if (k->rt)
-        sb_printf(b, "  float3 wp [[user(wp)]];\n");
+        sb_printf(b, "  float3 wp [[user(wp)]];\n%s", g_rt_wn ? "  float3 wn [[user(wn)]];\n" : "");
     sb_printf(b, "  float fog [[user(fog)]];\n  float ez [[user(ez)]];\n  float psize [[point_size]];\n};\n");
 }
 
@@ -177,6 +182,17 @@ void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
         sb_printf(b, "  o.pos = sm * o.pos;\n");
     if (k->rt) /* its place in the world, less the camera's: clip space back through the draw's camera */
         sb_printf(b, "  { float4 wr = rd.m * o.pos; o.wp = wr.xyz / wr.w; }\n");
+    if (k->rt && g_rt_wn) /* its normal: the place a unit along it, less the vertex's own, both through */
+    {
+        sb_printf(b, "  {\n    float4 q0 = float4(v0.xyz, 1.0), q1 = float4(v0.xyz + normalize(v3.xyz), 1.0), c0, c1;\n");
+        if (g_rt_pos < 0)
+            sb_printf(b, "    c0 = u.wvp * q0, c1 = u.wvp * q1;\n");
+        else
+            sb_printf(b, "    c0 = float4(dot(q0, u.vsc[%d]), dot(q0, u.vsc[%d]), dot(q0, u.vsc[%d]), dot(q0, u.vsc[%d]));\n"
+                         "    c1 = float4(dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]));\n",
+                g_rt_pos, g_rt_pos + 1, g_rt_pos + 2, g_rt_pos + 3, g_rt_pos, g_rt_pos + 1, g_rt_pos + 2, g_rt_pos + 3);
+        sb_printf(b, "    float4 a = rd.m * c0, e = rd.m * c1;\n    o.wn = e.xyz / e.w - a.xyz / a.w;\n  }\n");
+    }
     sb_printf(b, "  return o;\n}\n");
 }
 
@@ -429,7 +445,7 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
     int pix = pixel_lit(vk);
     sb_printf(b, "fragment float4 fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", pix ? "vin" : "in");
     if (k->rt)
-        sb_printf(b, ", constant RtDraw& rd [[buffer(5)]], depth2d<float> rt_smn [[texture(8)]], depth2d<float> rt_smf [[texture(9)]]");
+        sb_printf(b, ", constant RtDraw& rd [[buffer(5)]], depth2d_array<float> rt_sm [[texture(8)]]");
     for (int i = 0; i < 8; ++i)
     {
         int t = k->prog || i < k->nstages ? k->st[i].tex : 0;
@@ -449,12 +465,12 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
     }
 }
 
-/* Traced (rt): the sun's shadow, from the back end's two maps of the world seen from the sun (the near
- * one where it covers the place, else the far one): the colour loses rd.k.x of itself where the map
- * holds something nearer the sun - on faces toward it, fading in over their first few degrees and out
- * toward rd.k.z units away. The face's normal is the place's own slope across the pixel (the zone's
- * shaders pass no normal on); the place is looked up a little off the face along it (rd.c.x, c.z: a
- * texel and a half), through nine samples a texel apart (rd.c.w, k.w). */
+/* Traced (rt): the sun's shadow, from the back end's maps of the world seen from the sun (a layer a
+ * cascade, nearest first, each used out to its reach rd.cs[c].w and blended into the next over the last
+ * fifth of it; one that does not hold the place gives way to the next): the colour loses rd.k.x of itself
+ * where the map holds something nearer the sun, and on faces turned from it (smoothly across the turn,
+ * by the vertices' own normal when the draw has one - else the face's, its slope across the pixel),
+ * fading out toward rd.k.z units away. rt_look (the prelude) filters. */
 static void emit_rt_shadow(Sb* b)
 {
     sb_printf(b,
@@ -464,25 +480,27 @@ static void emit_rt_shadow(Sb* b)
         "    if (rd.sun.w > 0.0 && nn > 1e-20 && dist < rd.k.z) {\n"
         "      float3 n = rt_n * rsqrt(nn);\n"
         "      if (dot(n, in.wp) > 0.0) n = -n;\n"
-        "      float nl = dot(n, rd.sun.xyz);\n"
-        "      rt_w = smoothstep(0.0, 0.2, nl) * (1.0 - smoothstep(0.8 * rd.k.z, rd.k.z, dist));\n"
-        "      if (nl > 0.0) {\n"
-        "        constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
-        "        float4 q = rd.sn * float4(in.wp + n * rd.c.x, 1.0);\n"
-        "        bool nr = rd.bz.z > 0.0 && all(abs(q.xy) < 0.97) && q.z > 0.0 && q.z < 1.0;\n"
-        "        float step = rd.c.w, bias = rd.bz.x;\n"
-        "        if (!nr) q = rd.sf * float4(in.wp + n * rd.c.z, 1.0), step = rd.k.w, bias = rd.bz.y;\n"
-        "        if (all(abs(q.xy) < 1.0) && q.z > 0.0 && q.z < 1.0) {\n"
-        "          rt_c = nr ? 1.0 : 2.0;\n"
-        "          float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
-        "          float s = 0.0, z = q.z - bias;\n"
-        "          for (int j = -1; j <= 1; ++j)\n"
-        "            for (int i = -1; i <= 1; ++i)\n"
-        "              s += nr ? rt_smn.sample_compare(cmp, uv + float2(i, j) * step, z)\n"
-        "                      : rt_smf.sample_compare(cmp, uv + float2(i, j) * step, z);\n"
-        "          rt_vis = s / 9.0;\n"
+        "      float3 ns = n;\n");
+    if (g_rt_wn)
+        sb_printf(b,
+        "      if (dot(in.wn, in.wn) > 1e-12) { ns = normalize(in.wn); if (dot(ns, n) < 0.0) ns = -ns; }\n");
+    sb_printf(b,
+        "      float lit = smoothstep(-0.03, 0.2, dot(ns, rd.sun.xyz));\n"
+        "      rt_w = 1.0 - smoothstep(0.85 * rd.k.z, rd.k.z, dist);\n"
+        "      float v = 1.0;\n"
+        "      if (lit > 0.0) {\n"
+        "        int c = dist < rd.cs[0].w ? 0 : dist < rd.cs[1].w ? 1 : 2;\n"
+        "        v = rt_look(rt_sm, rd, c, in.wp, n);\n"
+        "        if (v < 0.0 && c < 2) c++, v = rt_look(rt_sm, rd, c, in.wp, n);\n"
+        "        float bl = c < 2 ? smoothstep(0.8 * rd.cs[c].w, rd.cs[c].w, dist) : 0.0;\n"
+        "        if (bl > 0.0) {\n"
+        "          float v2 = rt_look(rt_sm, rd, c + 1, in.wp, n);\n"
+        "          if (v2 >= 0.0) v = v < 0.0 ? v2 : mix(v, v2, bl);\n"
         "        }\n"
-        "      }\n"
+        "        rt_c = v < 0.0 ? 0.0 : float(c + 1);\n"
+        "        v = max(v, 0.0) + (v < 0.0 ? 1.0 : 0.0);\n"
+        "      } else rt_c = 4.0;\n"
+        "      rt_vis = lit * v;\n"
         "    }\n"
         "  }\n");
 }
@@ -515,9 +533,10 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
         }
         sb_printf(b, "  %s.rgb = mix(u.fogcolor.rgb, %s.rgb, f);\n", col, col);
     }
-    /* rd.k.y: the shadow alone (lit white, shadowed black; near map green, far red, neither blue) */
+    /* rd.k.y: the shadow alone (lit white, shadowed black; the near map green, the middle yellow, the far
+     * red, none blue) */
     if (k->rt)
-        sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : float3(1.0, 0.75, 0.75));\n", col);
+        sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : rt_c == 2.0 ? float3(1.0, 1.0, 0.7) : rt_c == 3.0 ? float3(1.0, 0.75, 0.75) : float3(0.6, 0.5, 0.8));\n", col);
     sb_printf(b, "  return %s;\n}\n", col);
 }
 
@@ -573,13 +592,33 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
 {
     Sb b = { 0 };
     sb_printf(&b, "%s", PRELUDE);
+    g_rt_pos = vk->prog ? gfx_msl_vs1_pos_consts(vs_tokens) : -1;
+    g_rt_wn = (vk->rt || fk->rt) && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
     /* traced: what the back end gives each draw (buffer 5, RtDraw in gfx_metal.m): clip space to the
      * world less the camera's place, the camera's place, toward the sun (w: 1 when there is one), the
-     * shadow's strength and how far out it reaches (k.x, k.z), and the sun's two shadow maps (near and
-     * far: the world less the camera's place to the map, the normal offsets, filter steps and depth
-     * biases) */
+     * shadow's strength and how far out it reaches (k.x, k.z; k.y: the debug view), and the sun's shadow
+     * cascades (the world less the camera's place to each map; its normal offset in world units, filter
+     * step, depth bias and reach) */
     if (vk->rt || fk->rt)
-        sb_printf(&b, "struct RtDraw { float4x4 m; float4 cam; float4 sun; float4 k; float4x4 sn, sf; float4 c; float4 bz; };\n");
+    {
+        sb_printf(&b, "struct RtDraw { float4x4 m; float4 cam; float4 sun; float4 k; float4x4 s[3]; float4 cs[3]; };\n");
+        /* the shadow at p (normal n) from cascade c: 0 shadowed .. 1 lit, -1 when the map does not hold
+         * it; sixteen compares a texel and a half apart, each filtered (a smooth edge some five texels
+         * wide) */
+        if (fk->rt)
+            sb_printf(&b,
+                "static float rt_look(depth2d_array<float> t, constant RtDraw& rd, int c, float3 p, float3 n) {\n"
+                "  constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
+                "  float4 q = rd.s[c] * float4(p + n * rd.cs[c].x, 1.0);\n"
+                "  if (any(abs(q.xy) > 0.98) || q.z <= 0.0 || q.z >= 1.0) return -1.0;\n"
+                "  float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+                "  float z = q.z - rd.cs[c].z, st = rd.cs[c].y, s = 0.0;\n"
+                "  for (int j = 0; j < 4; ++j)\n"
+                "    for (int i = 0; i < 4; ++i)\n"
+                "      s += t.sample_compare(cmp, uv + (float2(i, j) - 1.5) * st, uint(c), z);\n"
+                "  return s / 16.0;\n"
+                "}\n");
+    }
     emit_vout(&b, vk);
     if (vk->prog)
     {

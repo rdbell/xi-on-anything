@@ -2901,7 +2901,7 @@ static void scene_finish(const char* why)
 
 static void scene_note(GfxDraw* d)
 {
-    d->caster = 0;
+    d->caster = 0, d->receive = 0;
     uint32_t face, level;
     Obj* rt = obj(g_dev.rt);
     GfxTex* c = rt ? surface_gpu(rt, &face, &level) : NULL;
@@ -2971,6 +2971,7 @@ static void scene_note(GfxDraw* d)
      * zone's shaders; not the sky, the sun and its flare (unfogged, with views of their own) */
     d->caster = d->depth.zwrite && (!d->pipe.blend || (d->fs.alpha_func && d->fs.alpha_func != 8)) &&
         (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
+    d->receive = !d->vs.rhw && d->depth.zenable && (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
     const State* s = &g_dev.cur;
     GfxScene* sc = &g_scene.s;
     /* the camera and fog from the frame's first depth-writing fixed-function draw, a fogged one
