@@ -141,7 +141,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1029,7 +1029,8 @@ static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_
     {
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         id<MTLFunction> vf = [lib newFunctionWithName:@"vs_main"], ff = [lib newFunctionWithName:@"fs_main"];
-        if (k->lib.vs.shadow && !alpha_tested(&k->lib.fs)) /* depth alone: nothing for the fragments to do */
+        if (k->lib.vs.shadow == 1 && !alpha_tested(&k->lib.fs)) /* depth alone: nothing for the fragments to do (2: its
+                                                                     * colour too, the bounce light's map) */
             [ff release], ff = nil;
         if (k->lib.vs.capture) /* the triangles out to a buffer (rt_capture): nothing drawn */
             [ff release], ff = nil, pd.rasterizationEnabled = NO;
@@ -1209,6 +1210,9 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     /* the world's opaque draws traced: shaded by the scene's triangles as they are drawn (rt_draw_bind) */
     if (rt_draw_wanted(d))
         k.lib.vs.rt = k.lib.fs.rt = 1;
+    /* the volumetric fog (vfog): the world drawn clear, its fog put in after it (rt_defer_pass) */
+    if (g_fxs.vfog != 0.0f && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && (d->caster || d->receive) && !d->vs.rhw)
+        k.lib.fs.fog = 0;
     id<MTLRenderPipelineState> p = pipeline_for(&k, d->vs_tokens, d->ps_tokens);
     if (!p && k.lib.vs.rt)
     {
@@ -1639,7 +1643,7 @@ static void draw_encode(const GfxDraw* d)
             [g_enc setFragmentTexture:view atIndex:(NSUInteger)i];
             [g_enc setFragmentSamplerState:sampler(&sk) atIndex:(NSUInteger)i];
             t->used = g_serial;
-            if (rec && alpha_tested(&d->fs))
+            if (rec) /* (every caster's: the bounce light's map is in colour) */
                 rec->tex[i] = [view retain], rec->samp[i] = sk;
         }
 
@@ -2314,7 +2318,7 @@ static const struct
     { "rt_sun_azim", offsetof(__typeof__(g_fxs), rt_sun_azim), 0.0f },
     /* the traced sun shadows, in the world's own draws: how much of a surface's colour the shadow
      * takes (0: none - and the sun's maps back), and how far out they reach, in world units */
-    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.7f },
+    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.45f },
     { "rt_distance", offsetof(__typeof__(g_fxs), rt_distance), 500.0f },
     /* how far the near shadow map reaches (the finer one, round the camera), in world units */
     { "rt_near", offsetof(__typeof__(g_fxs), rt_near), 25.0f },
@@ -2323,6 +2327,15 @@ static const struct
     { "rt_sm_keep", offsetof(__typeof__(g_fxs), rt_sm_keep), 0.0f },
     { "rt_defer", offsetof(__typeof__(g_fxs), rt_defer), 1.0f },
     { "rt_only_vs", offsetof(__typeof__(g_fxs), rt_only_vs), 0.0f },
+    { "rt_gi", offsetof(__typeof__(g_fxs), rt_gi), 0.35f },
+    { "rt_gi_radius", offsetof(__typeof__(g_fxs), rt_gi_radius), 8.0f },
+    { "rt_soft", offsetof(__typeof__(g_fxs), rt_soft), 0.3f },
+    { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
+    { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
+    { "vfog_height", offsetof(__typeof__(g_fxs), vfog_height), 0.02f },
+    { "vfog_sun", offsetof(__typeof__(g_fxs), vfog_sun), 1.0f },
+    { "vfog_ambient", offsetof(__typeof__(g_fxs), vfog_ambient), 1.0f },
+    { "vfog_g", offsetof(__typeof__(g_fxs), vfog_g), 0.6f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
     { "draw", offsetof(__typeof__(g_fxs), draw), 0.0f },
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
@@ -3899,6 +3912,9 @@ static struct
     id<MTLRenderPipelineState> solid, alpha;
     id<MTLTexture> map;    /* a layer a cascade, nearest first */
     id<MTLTexture> scol;   /* the colour the casters' pipelines are built with (never kept) */
+    id<MTLTexture> rsm;    /* the middle cascade's casters in colour, as the sun sees them (the bounce light) */
+    float rsm_inv[16];     /* that map back to the world less the camera's place */
+    id<MTLTexture> ccopy;  /* the world's colour, read by the pass as it writes it */
     float rel[16];         /* the maps' camera: its clip space to the world less its place (the pass) */
     id<MTLLibrary> dlib;   /* the pass (rt_defer) */
     id<MTLRenderPipelineState> dpipe;
@@ -3942,6 +3958,11 @@ static int sm_init(void)
         cd.usage = MTLTextureUsageRenderTarget;
         cd.storageMode = MTLStorageModeMemoryless;
         g_sm.scol = [g_dev newTextureWithDescriptor:cd];
+        MTLTextureDescriptor* rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:RT_MAP height:RT_MAP mipmapped:YES];
+        rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        rd.storageMode = MTLStorageModePrivate;
+        g_sm.rsm = [g_dev newTextureWithDescriptor:rd];
     }
     if (!g_sm.solid || !g_sm.alpha || !g_sm.map || !g_sm.scol)
     {
@@ -4039,9 +4060,11 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.clearDepth = 1.0;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].texture = g_sm.scol;
-    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-    rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    int colour = layer == 1 && g_sm.rsm && g_fxs.rt_gi > 0.0f; /* the bounce light's map */
+    rp.colorAttachments[0].texture = colour ? g_sm.rsm : g_sm.scol;
+    rp.colorAttachments[0].loadAction = colour ? MTLLoadActionClear : MTLLoadActionDontCare;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = colour ? MTLStoreActionStore : MTLStoreActionDontCare;
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
     [e setViewport:(MTLViewport){ 0, 0, RT_MAP, RT_MAP, 0, 1 }];
     [e setDepthStencilState:g_fx.sdepth];
@@ -4146,11 +4169,14 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         PipeKey pk;
         memset(&pk, 0, sizeof pk);
         pk.lib = cs->lib;
-        pk.lib.vs.shadow = 1, pk.lib.vs.pixel = 0, pk.lib.vs.rt = 0, pk.lib.fs.rt = 0;
-        /* every caster with its own functions whole (the position-alone variant drew nothing of the
-         * zone's shaders); an alpha-tested one's test done with its textures */
+        pk.lib.vs.shadow = colour ? 2 : 1, pk.lib.vs.pixel = 0, pk.lib.vs.rt = 0, pk.lib.fs.rt = 0;
+        if (colour)
+            pk.lib.fs.fog = 0; /* its colour as the sun sees it: no fog of the camera's */
+        /* the position alone where nothing but depth is wanted (one pipeline serves every draw with the
+         * same vertex layout); an alpha-tested caster's test done with its textures, and every caster's
+         * colour into the bounce light's map */
         int at = alpha_tested(&cs->lib.fs);
-        if (0)
+        if (!at && !colour)
         {
             /* the position alone: one pipeline serves every draw with the same vertex layout */
             GfxVsKey* v = &pk.lib.vs;
@@ -4161,7 +4187,8 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             memset(v->tci, 0, sizeof v->tci), memset(v->ttf, 0, sizeof v->ttf);
             memset(&pk.lib.fs, 0, sizeof pk.lib.fs);
         }
-        pk.color = (uint32_t)MTLPixelFormatR8Unorm, pk.depth = (uint32_t)MTLPixelFormatDepth32Float;
+        pk.color = (uint32_t)(colour ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm), pk.depth = (uint32_t)MTLPixelFormatDepth32Float;
+        pk.pipe.write_mask = 15;
         id<MTLRenderPipelineState> ps = pipeline_for(&pk, cs->vs, cs->ps);
         if (!ps)
             continue;
@@ -4169,7 +4196,7 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         for (int st = 0; st < GFX_NSTREAMS; ++st)
             [e setVertexBuffer:cs->vb[st] offset:cs->voff[st] atIndex:(NSUInteger)st];
         [e setVertexBuffer:cs->ub offset:cs->uoff atIndex:4];
-        (void)at;
+        if (at || colour)
         {
             [e setFragmentBuffer:cs->ub offset:cs->uoff atIndex:4];
             for (int t = 0; t < 8; ++t)
@@ -4200,7 +4227,7 @@ static const char DS_MSL[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
-    "            float4 pz; };\n"
+    "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; };\n"
     "struct DO { float4 pos [[position]]; };\n"
     "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
     "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
@@ -4224,11 +4251,71 @@ static const char DS_MSL[] =
     "      s += t.sample_compare(cmp, uv + (float2(i, j) - 1.5) * st, uint(c), z);\n"
     "  return s / 16.0;\n"
     "}\n"
+    /* the light the sunlit surfaces near p (normal n) throw onto it: the bounce light's map around p's
+     * place on it, each sample a surface at its depth there, its colour as the sun lit it, weighed by how
+     * p faces it and how far it is (a spiral of twelve over the reach, read from a mip: smooth) */
+    "static float3 ds_gi(constant DS& d, depth2d_array<float> sm, texture2d<float> rsm, float3 p, float3 n) {\n"
+    "  constexpr sampler ls(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);\n"
+    "  float4 q = d.s[1] * float4(p, 1.0);\n"
+    "  if (any(abs(q.xy) > 0.95)) return float3(0.0);\n"
+    "  float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+    "  float3 sum = float3(0.0); float wsum = 0.0;\n"
+    "  for (int i = 0; i < 12; ++i) {\n"
+    "    float t = (float(i) + 0.5) / 12.0, a = float(i) * 2.39996;\n"
+    "    float2 o = float2(cos(a), sin(a)) * sqrt(t) * d.gi.y;\n"
+    "    float2 us = uv + o;\n"
+    "    float zs = sm.sample(ls, us, 1u);\n"
+    "    if (zs >= 1.0) continue;\n"
+    "    float4 x = d.rinv * float4(us.x * 2.0 - 1.0, 1.0 - us.y * 2.0, zs, 1.0);\n"
+    "    float3 v = x.xyz / x.w - p;\n"
+    "    float dd = dot(v, v) + 1e-3, r2 = d.gi.z * d.gi.z;\n"
+    "    float w = saturate(0.3 + 0.7 * dot(n, v) * rsqrt(dd)) * r2 / (dd + r2 * 0.25);\n"
+    "    sum += rsm.sample(ls, us, level(d.gi.w)).rgb * w;\n"
+    "    wsum += 1.0;\n"
+    "  }\n"
+    "  return wsum > 0.0 ? sum / 12.0 : float3(0.0);\n"
+    "}\n"
+    /* the fog along the ray from the camera to p (dist away): 24 steps, each lit by the fog's colour and
+     * by the sun where the maps say it reaches, thinning with height; T what of the surface gets through */
+    "static float3 ds_vfog(constant DS& d, depth2d_array<float> sm, float3 p, float dist, thread float& T) {\n"
+    "  constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
+    "  T = 1.0;\n"
+    "  float t0 = min(d.vf.y, dist), seg = (dist - t0) / 24.0;\n"
+    "  if (seg <= 0.0) return float3(0.0);\n"
+    "  float3 dir = p / max(dist, 1e-3);\n"
+    "  float g = d.vf.w, mu = dot(dir, d.sun.xyz);\n"
+    "  float ph = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * mu, 1e-3), 1.5);\n"
+    "  float3 acc = float3(0.0);\n"
+    "  for (int i = 0; i < 24; ++i) {\n"
+    "    float t = t0 + (float(i) + 0.5) * seg;\n"
+    "    float3 x = dir * t;\n"
+    "    float rho = d.vf.x * exp(clamp(d.vf.z * x.y, -20.0, 4.0));\n" /* y down: above the camera thinner */
+    "    float lit = 1.0;\n"
+    "    if (d.sun.w > 0.0 && d.vf2.y > 0.0) {\n"
+    "      int c = t < d.cs[0].w ? 0 : t < d.cs[1].w ? 1 : 2;\n"
+    "      float4 q = d.s[c] * float4(x, 1.0);\n"
+    "      if (all(abs(q.xy) < 1.0) && q.z > 0.0 && q.z < 1.0)\n"
+    "        lit = sm.sample_compare(cmp, float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5), uint(c), q.z - d.cs[c].z);\n"
+    "    }\n"
+    "    float3 L = d.fogc.rgb * d.vf2.x + d.sunc.rgb * d.vf2.y * ph * lit;\n"
+    "    float e = exp(-rho * seg);\n"
+    "    acc += T * (1.0 - e) * L;\n"
+    "    T *= e;\n"
+    "  }\n"
+    "  return acc;\n"
+    "}\n"
     "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
-    "                      depth2d_array<float> sm [[texture(1)]]) {\n"
+    "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
+    "                      texture2d<float> rsm [[texture(3)]]) {\n"
     "  int2 px = int2(in.pos.xy);\n"
-    /* rt_debug 2..4: a cascade's map itself over the view (nearest dark) */
-    "  if (d.k.z >= 1.5) {\n"
+    "  float4 col = src.read(uint2(px));\n"
+    /* rt_debug 6: the bounce light's map itself */
+    "  if (d.k.z > 5.5 && d.k.z < 6.5) {\n"
+    "    float2 uv = (in.pos.xy - d.vp.xy) / d.vp.zw; uv.x = uv.x * d.vp.w / d.vp.z;\n"
+    "    constexpr sampler ls(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+    "    return uv.x > 1.0 ? float4(0.1, 0.1, 0.3, 1.0) : float4(rsm.sample(ls, uv).rgb, 1.0);\n"
+    "  }\n"
+    "  if (d.k.z >= 1.5 && d.k.z < 4.5) {\n"
     "    float2 uv = (in.pos.xy - d.vp.xy) / d.vp.zw; uv.x = uv.x * d.vp.w / d.vp.z;\n"
     "    if (uv.x > 1.0) return float4(0.1, 0.1, 0.3, 1.0);\n"
     "    float m = sm.read(uint2(uv * float2(sm.get_width(), sm.get_height())), uint(d.k.z - 2.0 + 0.5));\n"
@@ -4236,7 +4323,11 @@ static const char DS_MSL[] =
     "  }\n"
     "  float z, zx0, zx1, zy0, zy1;\n"
     "  float3 p = ds_at(d, dep, px, z);\n"
-    "  if (z >= 1.0) return float4(0.0);\n"
+    "  if (z >= 1.0) {\n"
+    "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
+    "    float T; float3 fa = ds_vfog(d, sm, normalize(p) * d.vf2.z, d.vf2.z, T);\n"
+    "    return float4(col.rgb * T + fa, col.a);\n"
+    "  }\n"
     /* the face: toward the nearer neighbour on each axis (the far one may be another object) */
     "  float3 px0 = ds_at(d, dep, px - int2(1, 0), zx0), px1 = ds_at(d, dep, px + int2(1, 0), zx1);\n"
     "  float3 py0 = ds_at(d, dep, px - int2(0, 1), zy0), py1 = ds_at(d, dep, px + int2(0, 1), zy1);\n"
@@ -4247,7 +4338,11 @@ static const char DS_MSL[] =
     "  n = nn > 1e-20 ? n * rsqrt(nn) : float3(0.0, -1.0, 0.0);\n"
     "  if (dot(n, p) > 0.0) n = -n;\n"
     "  float dist = length(p);\n"
-    "  if (dist >= d.k.y) return float4(0.0);\n"
+    "  if (dist >= d.k.y) {\n"
+    "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
+    "    float T; float3 fa = ds_vfog(d, sm, p, dist, T);\n"
+    "    return float4(col.rgb * T + fa, col.a);\n"
+    "  }\n"
     "  int c = dist < d.cs[0].w ? 0 : dist < d.cs[1].w ? 1 : 2;\n"
     "  float v = ds_look(d, sm, c, p, n);\n"
     "  if (v < 0.0 && c < 2) c++, v = ds_look(d, sm, c, p, n);\n"
@@ -4256,7 +4351,8 @@ static const char DS_MSL[] =
     "    float v2 = ds_look(d, sm, c + 1, p, n);\n"
     "    if (v2 >= 0.0) v = v < 0.0 ? v2 : mix(v, v2, bl);\n"
     "  }\n"
-    "  if (v < 0.0) return d.k.z > 0.0 ? float4(0.8, 0.1, 0.1, 1.0) : float4(0.0);\n"
+    "  if (v < 0.0 && d.k.z > 0.0) return float4(0.8, 0.1, 0.1, 1.0);\n"
+    "  if (v < 0.0) v = 1.0;\n"
     "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
     /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
     "  float f = 1.0;\n"
@@ -4265,8 +4361,19 @@ static const char DS_MSL[] =
     "    float w = d.pz.y / (zn - d.pz.x);\n"
     "    f = saturate(clamp((d.fog.y - abs(w)) * d.fog.x, d.fog.z, d.fog.w));\n"
     "  }\n"
-    "  if (d.k.z > 0.0) return float4(float3(0.15 + 0.85 * v), 1.0);\n"
-    "  return float4((1.0 - f) * d.fogc.rgb * a, a);\n"
+    "  float3 gi = d.gi.x > 0.0 ? ds_gi(d, sm, rsm, p, n) * d.gi.x : float3(0.0);\n"
+    "  if (d.k.z > 4.5 && d.k.z < 5.5) return float4(gi * 3.0, 1.0);\n"
+    /* rt_debug 8: the left half without the bounce light, the right with it */
+    "  if (d.k.z > 7.5 && in.pos.x < d.vp.x + d.vp.z * 0.5) gi = float3(0.0);\n"
+    "  if (d.k.z > 0.0 && d.k.z < 7.5) return float4(float3(0.15 + 0.85 * v) + gi, 1.0);\n"
+    /* darkened by a but the fog's share; the bounce light adds to what the surface shows, fogged alike */
+    /* the colour as it is, less the shadow's share of what the fog leaves of the surface (no colour put in:
+     * its texture stays whatever the fog is) */
+    "  float3 oc = col.rgb * (1.0 - a * f);\n"
+    /* the bounce light where the sun does not reach (in full sun it is little beside it) */
+    "  oc += col.rgb * gi * f * (1.0 - 0.75 * v);\n"
+    "  if (d.vf2.w > 0.0) { float T; float3 fa = ds_vfog(d, sm, p, dist, T); oc = oc * T + fa; }\n"
+    "  return float4(oc, col.a);\n"
     "}\n";
 
 typedef struct DsU
@@ -4280,6 +4387,11 @@ typedef struct DsU
     float fogc[4];
     float vp[4];   /* the scene's viewport in the target */
     float pz[4];   /* P22, P32 (z = P22 + P32 / w), the viewport's depth range */
+    float rinv[16]; /* the bounce light's map (the middle cascade) back to the world less the camera's place */
+    float gi[4];    /* the bounce light's strength (0: none), its reach in map uv, in world units, the mip read */
+    float vf[4];    /* the volumetric fog: density a unit, where it starts, its fall with height a unit, the sun's lobe g */
+    float vf2[4];   /* its ambient light, its sunlight, how far a ray of the sky goes, on (0: none) */
+    float sunc[4];  /* the sun's colour */
 } DsU;
 
 /* the pass into ct (its depth dep), for scene s */
@@ -4287,8 +4399,9 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
 {
     if (!g_sm.ok || !g_sm.map)
         return;
-    if (!g_sm.dlib)
-        g_sm.dlib = compile(DS_MSL);
+    static int dlib_tried;
+    if (!g_sm.dlib && !dlib_tried)
+        dlib_tried = 1, g_sm.dlib = compile(DS_MSL);
     if (!g_sm.dlib)
         return;
     if (!g_sm.dpipe || g_sm.dfmt != ct.pixelFormat)
@@ -4299,10 +4412,7 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         pd.vertexFunction = vf, pd.fragmentFunction = ff;
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.pixelFormat = ct.pixelFormat;
-        ca.blendingEnabled = YES; /* out = src + dst (1 - a): darkened by a, the fog's share given back */
-        ca.rgbBlendOperation = ca.alphaBlendOperation = MTLBlendOperationAdd;
-        ca.sourceRGBBlendFactor = MTLBlendFactorOne, ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        ca.sourceAlphaBlendFactor = MTLBlendFactorZero, ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        (void)ca; /* the colour written whole (the pass reads a copy of it) */
         NSError* err = nil;
         g_sm.dpipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!g_sm.dpipe)
@@ -4319,9 +4429,11 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     {
         const SmCascade* k = &g_sm.c[c < g_sm.nc ? c : g_sm.nc - 1];
         memcpy(u.s[c], k->m, 64);
-        /* two texels off the face along its normal, a texel of depth, a filter step of a texel and a half */
-        u.cs[c][0] = (float)(2.0 * k->texel), u.cs[c][1] = 1.5f / RT_MAP;
-        u.cs[c][2] = (float)(k->texel / k->range), u.cs[c][3] = (float)k->reach;
+        /* the filter's step: rt_soft world units across its four, at least a texel and a half; off the face along
+         * its normal by two of those steps' texels, as much of depth (a wider filter reaches further round) */
+        double step = fmax(1.5, fmax(g_fxs.rt_soft, 0.0) / k->texel / 3.0);
+        u.cs[c][0] = (float)(1.3 * step * k->texel), u.cs[c][1] = (float)(step / RT_MAP);
+        u.cs[c][2] = (float)(0.7 * step * k->texel / k->range), u.cs[c][3] = (float)k->reach;
     }
     memcpy(u.sun, g_rtx.sun_now, 16);
     u.k[0] = g_rtx.k_now[0], u.k[1] = g_rtx.k_now[2], u.k[2] = g_fxs.rt_debug;
@@ -4334,6 +4446,52 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     if (maxz <= minz)
         minz = 0, maxz = 1;
     u.pz[0] = s->proj[10], u.pz[1] = s->proj[14], u.pz[2] = minz, u.pz[3] = maxz;
+    if (g_fxs.rt_gi > 0.0f && g_sm.rsm && g_sm.nc > 1)
+    {
+        /* the reach: rt_gi_radius world units in the middle map's uv (a texel is c[1].texel units); the mip
+         * whose texel is about a twelfth of it */
+        double r = fmax(g_fxs.rt_gi_radius, 0.5), texel = g_sm.c[1].texel;
+        memcpy(u.rinv, g_sm.rsm_inv, 64);
+        u.gi[0] = g_fxs.rt_gi, u.gi[1] = (float)(r / (texel * RT_MAP)), u.gi[2] = (float)r;
+        u.gi[3] = (float)fmax(0.0, log2(r / 6.0 / texel));
+    }
+    if (g_fxs.vfog != 0.0f)
+    {
+        /* its density from the game's fog when not given: most of the way gone where the game's ends */
+        float dens = g_fxs.vfog_density, start = 0.0f;
+        if (dens <= 0.0f)
+        {
+            dens = 0.004f;
+            if (g_zfog_serial + 2 >= g_serial && g_zfog[0] > 0.0f && g_zfog[1] > 0.0f)
+            {
+                float end = g_zfog[1], len = 1.0f / g_zfog[0];
+                start = fmaxf(end - len, 0.0f);
+                dens = 3.5f / fmaxf(end - start, 1.0f);
+            }
+        }
+        u.vf[0] = dens, u.vf[1] = start, u.vf[2] = g_fxs.vfog_height, u.vf[3] = fminf(fmaxf(g_fxs.vfog_g, -0.9f), 0.9f);
+        u.vf2[0] = g_fxs.vfog_ambient, u.vf2[1] = g_fxs.vfog_sun, u.vf2[2] = 800.0f, u.vf2[3] = 1.0f;
+        memset(u.fog, 0, sizeof u.fog); /* the world drawn clear: no fog's share in its colour */
+        float sc[3] = { s->sun_color[0], s->sun_color[1], s->sun_color[2] };
+        if (sc[0] + sc[1] + sc[2] < 0.05f)
+            sc[0] = 1.0f, sc[1] = 0.93f, sc[2] = 0.8f;
+        memcpy(u.sunc, sc, 12);
+    }
+    if (!g_sm.ccopy || g_sm.ccopy.width != ct.width || g_sm.ccopy.height != ct.height || g_sm.ccopy.pixelFormat != ct.pixelFormat)
+    {
+        [g_sm.ccopy release];
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ct.pixelFormat width:ct.width
+                                                                                     height:ct.height mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        g_sm.ccopy = [g_dev newTextureWithDescriptor:td];
+    }
+    {
+        id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+        [b copyFromTexture:ct sourceSlice:0 sourceLevel:0 toTexture:g_sm.ccopy destinationSlice:0 destinationLevel:0
+                sliceCount:1 levelCount:1];
+        [b endEncoding];
+    }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = ct;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -4344,6 +4502,8 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     [e setFragmentBytes:&u length:sizeof u atIndex:0];
     [e setFragmentTexture:dep atIndex:0];
     [e setFragmentTexture:g_sm.map atIndex:1];
+    [e setFragmentTexture:g_sm.ccopy atIndex:2];
+    [e setFragmentTexture:g_sm.rsm atIndex:3];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
@@ -4398,6 +4558,19 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
     g_sm.drawn = 0, g_sm.instances = g_ncasters;
     for (int c = 0; c < g_sm.nc; ++c)
         rt_map_casters((uint32_t)c, &g_sm.c[c], rel, cam);
+    if (g_sm.rsm && g_fxs.rt_gi > 0.0f && g_sm.nc > 1)
+    {
+        /* its mips: the bounce light gathered from the map's averages, smooth */
+        id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+        [b generateMipmapsForTexture:g_sm.rsm];
+        [b endEncoding];
+        double km[16], inv[16];
+        for (int j = 0; j < 16; ++j)
+            km[j] = g_sm.c[1].m[j];
+        if (matd_inverse(inv, km))
+            for (int j = 0; j < 16; ++j)
+                g_sm.rsm_inv[j] = (float)inv[j];
+    }
     /* the check: /tmp/ffxi_dumpmap there - each cascade's map to /tmp/ffxi_map<c>.pgm (1024 across) */
     if (!access("/tmp/ffxi_dumpmap", F_OK))
     {
@@ -5359,8 +5532,35 @@ static struct
     uint64_t serial;
 } g_wf;
 
+static void scene_done_impl(GfxTex* color, const GfxScene* s);
+static uint32_t g_late_last; /* world draws after the effects in the last frame completed (gfx_world_final) */
+static struct
+{
+    GfxTex* color;
+    GfxScene scene;
+    uint64_t serial;
+} g_fxd; /* the effects put off till the world is complete */
+
+/* The effects once the world is complete when the last frame drew much of its world after them (the title's
+ * flythrough draws its terrain after an effect-like layer); else as its scene ends, under its effects */
+void gfx_scene_done(GfxTex* color, const GfxScene* s)
+{
+    if (g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_late_last > 50 && color)
+    {
+        g_fxd.color = color, g_fxd.scene = *s, g_fxd.serial = g_serial;
+        return;
+    }
+    scene_done_impl(color, s);
+}
+
 void gfx_world_final(void)
 {
+    g_late_last = g_late_serial == g_serial ? g_nlate : 0;
+    if (g_fxd.serial == g_serial && g_fxd.color)
+    {
+        g_fxd.serial = 0;
+        scene_done_impl(g_fxd.color, &g_fxd.scene);
+    }
     if (!g_dev || g_wf.serial != g_serial || !g_wf.color || g_fxs.rt_defer == 0.0f || g_fxs.rt <= 0.0f)
         return;
     g_wf.serial = 0;
@@ -5376,7 +5576,7 @@ void gfx_world_final(void)
     }
 }
 
-void gfx_scene_done(GfxTex* color, const GfxScene* s)
+static void scene_done_impl(GfxTex* color, const GfxScene* s)
 {
     if (!g_dev || g_fxs.fx == 0.0f || !color || color->type != GFX_TEX_2D)
         return;

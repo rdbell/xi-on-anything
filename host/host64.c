@@ -404,17 +404,45 @@ static void setup_lod(void)
 /* --- culling -------------------------------------------------------------------------------------------
  * 0x10181bb0 (2026-09-03) tests an object's box against a camera's clip matrix - the matrix at [esp+4]
  * on entry, the box at [esp+8] - and returns nonzero when every corner is off one side, the object
- * then not drawn. Its entry is hooked ("cull_test"): with the settings file's nocull (1) it is handed a
- * matrix that puts every point at the middle of the view, every map object then drawn, in view or not
- * (for testing: it costs a third of the frame rate). The game's test stands otherwise. */
+ * then not drawn. Its entry is hooked ("cull_test"): a map object within cull_near units of the camera
+ * (the settings file's, 60 when not set) is handed a matrix that puts every point at the middle of the
+ * view - drawn in view or not, so it keeps casting its shadow into view; with nocull (1) every object
+ * is (for testing: it costs a third of the frame rate). The game's test stands for the rest. */
 #ifdef FFXI_HOOK_CULL_TEST
 extern GuestFn rt_hook_cull_test;
 #endif
 static uint32_t g_cull_inside; /* the matrix: x, y, z 0 and w 1 for every point */
 
+static float rdf(uint32_t a)
+{
+    uint32_t v = rd32(a);
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+}
+
 static void cull_test(Guest* g)
 {
-    if (g_cull_inside && gfx_fx_get("nocull") >= 0.5f)
+    if (!g_cull_inside)
+        return;
+    if (gfx_fx_get("nocull") >= 0.5f)
+    {
+        wr32(g->esp + 4, g_cull_inside);
+        return;
+    }
+    /* a map object (the map in ecx tests it against one of its two cull matrices, the object's box at
+     * +0xf4 of it) out of view but near the camera is drawn all the same: what stands just beside or
+     * behind the camera casts its shadow into view, and its going as the camera turns moved them */
+    uint32_t map = g->ecx, m = rd32(g->esp + 4), box = rd32(g->esp + 8);
+    if (m != map + 0x38edc && m != map + 0x38fdc)
+        return;
+    float near = gfx_fx_get("cull_near");
+    if (near <= 0.0f)
+        near = 60.0f;
+    uint32_t obj = box - 0xf4;
+    float dx = rdf(obj + 0x1c) - rdf(map + 0x390f0), dy = rdf(obj + 0x20) - rdf(map + 0x390f4),
+          dz = rdf(obj + 0x24) - rdf(map + 0x390f8);
+    if (dx * dx + dy * dy + dz * dz < near * near)
         wr32(g->esp + 4, g_cull_inside);
 }
 
