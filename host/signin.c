@@ -1297,15 +1297,10 @@ static void key_act(Ui* u, const SDL_KeyboardEvent* e)
     }
 }
 
-int signin_run(const SigninSetup* setup, SigninResult* out)
+/* where the screen keeps its files: the data folder, signin.cfg and settings.reg (made when missing) */
+static void signin_files(const SigninSetup* setup, SigninResult* out, char* cfg_path, size_t n)
 {
-    memset(out, 0, sizeof *out);
-    Ui* u = calloc(1, sizeof *u);
-    if (!u)
-        return -1;
-    u->host_game = setup->host_game;
-    /* where it keeps its files */
-    char dir[1024], cfg_path[1100];
+    char dir[1024];
     if (setup->data_dir)
         SDL_strlcpy(dir, setup->data_dir, sizeof dir);
     else
@@ -1315,9 +1310,33 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         SDL_free(pref);
     }
     SDL_strlcpy(out->data_dir, dir, sizeof out->data_dir);
-    config_path(dir, "signin.cfg", cfg_path, sizeof cfg_path);
+    config_path(dir, "signin.cfg", cfg_path, n);
     config_path(dir, "settings.reg", out->settings_reg, sizeof out->settings_reg);
     default_settings(out->settings_reg, setup);
+}
+
+void signin_paths(const SigninSetup* setup, SigninResult* out)
+{
+    memset(out, 0, sizeof *out);
+    char cfg_path[1100];
+    signin_files(setup, out, cfg_path, sizeof cfg_path);
+    Config c;
+    memset(&c, 0, sizeof c);
+    c.space = setup->default_space >= 0 ? setup->default_space != 0 : 1;
+    config_load(cfg_path, &c);
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, c.space ? "1" : "0");
+}
+
+int signin_run(const SigninSetup* setup, SigninResult* out)
+{
+    memset(out, 0, sizeof *out);
+    Ui* u = calloc(1, sizeof *u);
+    if (!u)
+        return -1;
+    u->host_game = setup->host_game;
+    /* where it keeps its files */
+    char cfg_path[1100];
+    signin_files(setup, out, cfg_path, sizeof cfg_path);
 
     Config* c = &u->cfg;
     c->remember = 1, c->theme = 1;
@@ -1420,8 +1439,8 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         u->ink.image = "mojiink";
         uidraw_load_rgba(&u->fonts.tex, "mojiink", moji.rgba, moji.w, moji.h);
         dat_image_free(&moji);
-        hires_font(&u->fonts.tex, dir);
-        hires_gauge(&u->menu.tex, dir);
+        hires_font(&u->fonts.tex, out->data_dir);
+        hires_gauge(&u->menu.tex, out->data_dir);
     }
     if (!ok)
     {

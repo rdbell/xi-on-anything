@@ -38,3 +38,8 @@ typedef struct SigninResult
 /* Shows the screen until the player signs in (1) or quits (0). -1 when there is nothing to draw
  * with: host64 then signs in from its command line as before. */
 int signin_run(const SigninSetup* setup, SigninResult* out);
+
+/* What the screen would set up without showing it (a sign-in from the command line): the data folder,
+ * settings.reg in it (made from the first-run defaults when there is none) and the full-screen Space
+ * setting the player saved. Fills out's settings_reg and data_dir (window and server stay 0). */
+void signin_paths(const SigninSetup* setup, SigninResult* out);

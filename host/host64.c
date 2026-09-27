@@ -575,10 +575,11 @@ int main(int argc, char** argv)
     }
     if (!lsb.password)
         lsb.password = getenv("FFXI_PASSWORD");
-    if (!(lsb.user && (lsb.password || lsb.login_token)))
+    int cmdline_signin = lsb.user && (lsb.password || lsb.login_token);
     {
-        /* Nothing on the command line signs in: the sign-in screen, in the game's own art. Its
-         * window becomes the game's. */
+        /* The sign-in screen, in the game's own art, when nothing on the command line signs in: its
+         * window becomes the game's. Signed in from the command line, what it would set up all the
+         * same - the data folder, the player's display settings, the game's saved ones. */
         SigninSetup su = { game, data_dir, server_name, lsb.user,
                            lsb.password, lsb.otp, lsb.auth_port != 54231 ? lsb.auth_port : 0,
                            lsb.data_port != 54230 ? lsb.data_port : 0, lsb.view_port != 54001 ? lsb.view_port : 0 };
@@ -599,13 +600,20 @@ int main(int argc, char** argv)
         if (app_default("FFXIBackground", app_val, sizeof app_val) && app_resource(app_val, app_bg, sizeof app_bg))
             su.default_background = app_bg;
         SigninResult sr;
-        int r = signin_run(&su, &sr);
+        int r;
+        if (cmdline_signin)
+            signin_paths(&su, &sr), r = 2;
+        else
+            r = signin_run(&su, &sr);
         if (r == 0)
             return 0;
-        if (r > 0)
+        if (r == 1)
         {
             game_server = sr.server;
             user32_adopt_window(sr.window);
+        }
+        if (r > 0)
+        {
             if (!nfinals)
                 finals[nfinals++] = strdup(sr.settings_reg);
             /* its folder for host64's files and the game's saved settings, the bundled registry
@@ -621,7 +629,8 @@ int main(int argc, char** argv)
             }
             if (!nregs && bundled_registry(argv[0], base_reg, sizeof base_reg))
                 regs[nregs++] = base_reg;
-            lsb.user = NULL; /* signed in */
+            if (r == 1)
+                lsb.user = NULL; /* signed in */
         }
         else if (!lsb.user)
         {
