@@ -4705,7 +4705,8 @@ static const char DS_MSL[] =
     "  if (v < 0.0 && d.k.z > 0.0 && d.k.z < 7.5) return float4(0.8, 0.1, 0.1, 1.0);\n"
     "  if (v < 0.0) v = 1.0;\n"
     /* faces turned from the sun in shade too, smoothly across the turn (fwd.w of it: rt_face) */
-    "  v = min(v, mix(1.0, smoothstep(-0.05, 0.3, dot(ns, d.sun.xyz)), d.fwd.w));\n"
+    /* (edge-on to the sun still mostly lit - the sky lights it too; fully shaded only turned well away) */
+    "  v = min(v, mix(1.0, smoothstep(-0.35, 0.15, dot(ns, d.sun.xyz)), d.fwd.w));\n"
     "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
     /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
     "  float f = 1.0;\n"
