@@ -143,7 +143,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1269,6 +1269,18 @@ static struct
     char note[512]; /* the check: the first few as given */
 } g_zl;
 
+/* the glows the game draws at its lamps and torches (additive, no depth written, small): each one's
+ * middle - a fixed-function one's in the world (its own camera), a shader's in the frame's clip space -
+ * a light there (rt_glow) */
+enum { RT_GLOWS = 64 };
+static struct
+{
+    double p[RT_GLOWS][4]; /* world (w 1) or clip (w the clip's) */
+    uint8_t clip[RT_GLOWS];
+    uint32_t n;
+    uint64_t serial;
+} g_gl;
+
 /* the zone's fog as its shaders make it (c9.x, c9.z, c5.x, c10.x) and the frame it was seen in (rt_defer) */
 static float g_zfog[4];
 static uint64_t g_zfog_serial;
@@ -1526,6 +1538,55 @@ void gfx_draw(const GfxDraw* d)
 {
     if (!g_dev || !d->count)
         return;
+    if (d->pipe.blend && !d->depth.zwrite && !d->vs.rhw) /* the check: blended 3D by kind */
+    {
+        static uint32_t cnt[512], frames;
+        static uint64_t last;
+        int k = (d->pipe.src & 15) | (d->pipe.dst & 15) << 4 | (d->depth.zenable ? 256 : 0);
+        cnt[k] += d->count <= 64 ? 1 : 0;
+        cnt[k] += 0;
+        if (g_serial != last)
+            last = g_serial, frames++;
+        if (frames >= 120)
+        {
+            fprintf(stderr, "[recomp] gfx: blended 3D small draws by src/dst/zenable over 120 frames:");
+            for (int i = 0; i < 512; ++i)
+                if (cnt[i])
+                    fprintf(stderr, " %d/%d/%d:%u", i & 15, i >> 4 & 15, i >> 8, cnt[i]);
+            fprintf(stderr, "\n");
+            memset(cnt, 0, sizeof cnt), frames = 0;
+        }
+    }
+    if (g_fxs.rt_glow > 0.0f && d->pipe.blend && d->pipe.dst == 2 && !d->depth.zwrite && d->depth.zenable && !d->vs.rhw &&
+        d->count <= 64)
+    {
+        if (g_gl.serial != g_serial)
+            g_gl.serial = g_serial, g_gl.n = 0;
+        double o[4];
+        int clip = d->vs.prog != 0, ok = 1;
+        if (clip)
+            for (int r = 0; r < 4; ++r)
+                o[r] = d->u.vsc[r][3];
+        else
+        {
+            double vp[16], inv[16], c[4] = { d->u.wvp[12], d->u.wvp[13], d->u.wvp[14], d->u.wvp[15] };
+            for (int j = 0; j < 16; ++j)
+                vp[j] = d->view_proj[j];
+            ok = matd_inverse(inv, vp);
+            for (int j = 0; ok && j < 4; ++j)
+                o[j] = c[0] * inv[j] + c[1] * inv[4 + j] + c[2] * inv[8 + j] + c[3] * inv[12 + j];
+            if (ok && fabs(o[3]) > 1e-12)
+                o[0] /= o[3], o[1] /= o[3], o[2] /= o[3], o[3] = 1.0;
+            else
+                ok = 0;
+        }
+        for (uint32_t i = 0; ok && i < g_gl.n; ++i)
+            if (g_gl.clip[i] == clip && fabs(g_gl.p[i][0] - o[0]) + fabs(g_gl.p[i][1] - o[1]) + fabs(g_gl.p[i][2] - o[2]) +
+                    fabs(g_gl.p[i][3] - o[3]) < 0.05)
+                ok = 0;
+        if (ok && g_gl.n < RT_GLOWS)
+            memcpy(g_gl.p[g_gl.n], o, sizeof o), g_gl.clip[g_gl.n++] = (uint8_t)clip;
+    }
     /* testing: the 3D alone - no screen-space draws but those of a rendered image (the scene's own) */
     if (g_fxs.hide_ui != 0.0f && d->vs.rhw && !(d->tex[0] && d->tex[0]->use == GFX_USE_RT))
         return;
@@ -2372,6 +2433,9 @@ static const struct
     { "rt_soft", offsetof(__typeof__(g_fxs), rt_soft), 0.3f },
     { "rt_point", offsetof(__typeof__(g_fxs), rt_point), 1.5f },
     { "rt_point_range", offsetof(__typeof__(g_fxs), rt_point_range), 2.0f },
+    { "rt_glow", offsetof(__typeof__(g_fxs), rt_glow), 1.0f },
+    { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.4f },
+    { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
     { "vfog_height", offsetof(__typeof__(g_fxs), vfog_height), 0.02f },
@@ -3194,6 +3258,7 @@ static struct
     double pend_vp[16];
     uint32_t dr_solo, dr_solo_far;  /* the profile: frames whose camera came from a solo place; ones held */
     float sun_now[4], k_now[4];     /* toward the sun and the shadow's settings, as of the last scene */
+    float game_hour;                /* the game's hour, as the sun was set from it */
     float day;                      /* the sun's share of the light at the last scene (0: none, night) */
     uint64_t enc_pass;              /* the render pass given the structures (useResources) */
     uint32_t dr_exact, dr_pred, dr_ffp, dr_none; /* the profile: traced draws, by the camera they had */
@@ -4302,7 +4367,7 @@ static const char DS_MSL[] =
     "using namespace metal;\n"
     "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
     "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; float4 fwd; float4 pl;\n"
-    "            float4 lp[64]; float4 lc[64]; };\n"
+    "            float4 lp[128]; float4 lc[128]; };\n"
     "struct DO { float4 pos [[position]]; };\n"
     "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
     "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
@@ -4448,7 +4513,7 @@ static const char DS_MSL[] =
     /* rt_debug 9: the place rebuilt (a 2-unit grid on x/z, height in blue); 10: the far map's depth there
      * against the place's own (red: the map nearer the sun) */
     "  if (d.k.z > 8.5 && d.k.z < 9.5) { float2 g = fract(p.xz / 2.0); return float4(g.x < 0.1 || g.y < 0.1 ? 1.0 : 0.2, 0.2, fract(p.y / 5.0), 1.0); }\n"
-    "  if (d.k.z > 9.5) { float4 q = d.s[2] * float4(p, 1.0); float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+    "  if (d.k.z > 9.5 && d.k.z < 10.5) { float4 q = d.s[2] * float4(p, 1.0); float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
     "    float m = sm.read(uint2(clamp(uv, 0.0, 0.999) * float2(sm.get_width(), sm.get_height())), 2u);\n"
     "    return float4(saturate((q.z - m) * 200.0), saturate((m - q.z) * 200.0), q.z > 1.0 || q.z < 0.0 ? 1.0 : 0.0, 1.0); }\n"
     "  if (dist >= d.k.y) {\n"
@@ -4464,7 +4529,7 @@ static const char DS_MSL[] =
     "    float v2 = ds_look(d, sm, c + 1, p, n);\n"
     "    if (v2 >= 0.0) v = v < 0.0 ? v2 : mix(v, v2, bl);\n"
     "  }\n"
-    "  if (v < 0.0 && d.k.z > 0.0) return float4(0.8, 0.1, 0.1, 1.0);\n"
+    "  if (v < 0.0 && d.k.z > 0.0 && d.k.z < 7.5) return float4(0.8, 0.1, 0.1, 1.0);\n"
     "  if (v < 0.0) v = 1.0;\n"
     "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
     /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
@@ -4477,7 +4542,7 @@ static const char DS_MSL[] =
     "  float3 gi = d.gi.x > 0.0 ? ds_gi(d, sm, rsm, p, n) * d.gi.x : float3(0.0);\n"
     "  if (d.k.z > 4.5 && d.k.z < 5.5) return float4(gi * 3.0, 1.0);\n"
     /* rt_debug 8: the left half without the bounce light, the right with it */
-    "  if (d.k.z > 7.5 && in.pos.x < d.vp.x + d.vp.z * 0.5) gi = float3(0.0);\n"
+    "  if (d.k.z > 7.5 && d.k.z < 8.5 && in.pos.x < d.vp.x + d.vp.z * 0.5) gi = float3(0.0);\n"
     "  if (d.k.z > 0.0 && d.k.z < 7.5) return float4(float3(0.15 + 0.85 * v) + gi, 1.0);\n"
     /* darkened by a but the fog's share; the bounce light adds to what the surface shows, fogged alike */
     /* the colour as it is, less the shadow's share of what the fog leaves of the surface (no colour put in:
@@ -4495,11 +4560,19 @@ static const char DS_MSL[] =
     "    oc += col.rgb * d.lc[i].rgb * (d.pl.y * fall * ndl) * f;\n"
     "  }\n"
     "  if (d.vf2.w > 0.0) { float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, dist); oc = oc * fo.a + fo.rgb; }\n"
+    /* rt_debug 11: every light a dot where it hangs (seen through walls), its reach a faint ring */
+    "  if (d.k.z > 10.5) {\n"
+    "    float3 dir = p / max(dist, 1e-3);\n"
+    "    for (int i = 0; i < int(d.pl.x); ++i) {\n"
+    "      float t = dot(d.lp[i].xyz, dir); float3 c = dir * t - d.lp[i].xyz; float e = length(c);\n"
+    "      if (t > 0.0 && e < 0.012 * t) oc = d.lc[i].w > 0.5 ? float3(0.1, 1.0, 1.0) : float3(1.0, 0.1, 1.0);\n"
+    "    }\n"
+    "  }\n"
     "  return float4(oc, col.a);\n"
     "}\n";
 
 /* the game's point lights this frame and the last (the pass lights with the last complete frame's) */
-enum { RT_LIGHTS = 64 };
+enum { RT_LIGHTS = 128 };
 static uint32_t g_pl_shown; /* the profile: lights the last pass lit with */
 static struct
 {
@@ -4685,6 +4758,31 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 memcpy(u.lc[n], g_zl.col[i], 12);
                 n++;
             }
+        /* the glows: lights at them, warm, rt_glow_range across */
+        if (g_gl.serial == g_serial && g_fxs.rt_glow > 0.0f)
+            for (uint32_t i = 0; i < g_gl.n && n < RT_LIGHTS; ++i)
+            {
+                double w[4];
+                if (g_gl.clip[i])
+                {
+                    for (int j = 0; j < 4; ++j)
+                        w[j] = g_gl.p[i][0] * g_sm.rel[j] + g_gl.p[i][1] * g_sm.rel[4 + j] + g_gl.p[i][2] * g_sm.rel[8 + j] +
+                            g_gl.p[i][3] * g_sm.rel[12 + j];
+                    if (fabs(w[3]) < 1e-12)
+                        continue;
+                    w[0] /= w[3], w[1] /= w[3], w[2] /= w[3];
+                }
+                else
+                    for (int j = 0; j < 3; ++j)
+                        w[j] = g_gl.p[i][j] - g_sm.cam[j];
+                if (w[0] * w[0] + w[1] * w[1] + w[2] * w[2] > 200.0 * 200.0)
+                    continue;
+                u.lp[n][0] = (float)w[0], u.lp[n][1] = (float)w[1], u.lp[n][2] = (float)w[2];
+                u.lp[n][3] = g_fxs.rt_glow_range > 0.0f ? g_fxs.rt_glow_range : 8.0f;
+                u.lc[n][0] = 1.0f * g_fxs.rt_glow, u.lc[n][1] = 0.72f * g_fxs.rt_glow, u.lc[n][2] = 0.42f * g_fxs.rt_glow;
+                u.lc[n][3] = 1.0f; /* (a glow's: the debug view marks it apart) */
+                n++;
+            }
         u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point;
         g_pl_shown = n;
     }
@@ -4703,6 +4801,10 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 sliceCount:1 levelCount:1];
         [b endEncoding];
     }
+    /* (too large to pass inline: in this frame's ring) */
+    id<MTLBuffer> ub;
+    NSUInteger uoff;
+    memcpy(ring(sizeof u, 256, &ub, &uoff), &u, sizeof u);
     /* the fog at half size first */
     NSUInteger fw = ((NSUInteger)vp[2] + 1) / 2, fh = ((NSUInteger)vp[3] + 1) / 2;
     if (!g_sm.fogt || g_sm.fogt.width != fw || g_sm.fogt.height != fh)
@@ -4725,14 +4827,14 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         id<MTLRenderCommandEncoder> fe = [cmd() renderCommandEncoderWithDescriptor:fp];
         [fe setRenderPipelineState:g_sm.fpipe];
         [fe setViewport:(MTLViewport){ 0, 0, (double)fw, (double)fh, 0, 1 }];
-        [fe setFragmentBytes:&u length:sizeof u atIndex:0];
+        [fe setFragmentBuffer:ub offset:uoff atIndex:0];
         [fe setFragmentTexture:dep atIndex:0];
         [fe setFragmentTexture:g_sm.map atIndex:1];
         [fe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [fe endEncoding];
     }
     else
-        u.vf2[3] = 0.0f;
+        u.vf2[3] = 0.0f, memcpy((uint8_t*)[ub contents] + uoff, &u, sizeof u);
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = ct;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -4740,7 +4842,7 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:g_sm.dpipe];
     [e setViewport:(MTLViewport){ vp[0], vp[1], vp[2], vp[3], 0, 1 }];
-    [e setFragmentBytes:&u length:sizeof u atIndex:0];
+    [e setFragmentBuffer:ub offset:uoff atIndex:0];
     [e setFragmentTexture:dep atIndex:0];
     [e setFragmentTexture:g_sm.map atIndex:1];
     [e setFragmentTexture:g_sm.fogt atIndex:4];
@@ -6005,8 +6107,25 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 }
                 /* for the maps and the world's draws until the next scene: the sun, and the shadow's
                  * strength by day (the tester's sun at full) */
+                float strength = g_fxs.rt_shadow;
+                if (g_fxs.rt_sun_elev == 0.0f)
+                {
+                    /* the game's sun by its own clock (Vana'diel time: 25 times the Earth's, from 2002-01-01
+                     * 00:00 JST): rising toward +x at 6:00, overhead (world y down) at noon, setting at 18:00;
+                     * the moon along the same path by night, its shadows fainter; both fading at the horizon.
+                     * (The light the game gives its characters jumps with which of them are in view.) */
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    double t = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+                    double h = fmod((t - 1009810800.0) * 25.0 / 3600.0, 24.0);
+                    int night = h < 6.0 || h >= 18.0;
+                    double a = fmod(h - (night ? 18.0 : 6.0) + 24.0, 24.0) / 12.0 * M_PI;
+                    u.sunw[0] = (float)cos(a), u.sunw[1] = (float)-sin(a), u.sunw[2] = 0.0f, u.sunw[3] = 1.0f;
+                    float up = (float)sin(a);
+                    strength *= (night ? g_fxs.rt_moon : 1.0f) * fminf(fmaxf((up - 0.03f) / 0.12f, 0.0f), 1.0f);
+                    g_rtx.game_hour = (float)h;
+                }
                 memcpy(g_rtx.sun_now, u.sunw, 16);
-                float strength = g_fxs.rt_shadow * (g_fxs.rt_sun_elev != 0.0f ? 1.0f : g_rtx.day);
                 g_rtx.sun_now[3] = strength > 0.0f ? g_rtx.sun_now[3] : 0.0f;
                 g_rtx.k_now[0] = strength, g_rtx.k_now[2] = fmaxf(g_fxs.rt_distance, 1.0f);
                 /* the structures, the sun's maps and its shadow once the world is complete (gfx_world_final:
