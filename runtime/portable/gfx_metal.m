@@ -1329,6 +1329,7 @@ typedef struct Caster
     const uint32_t *vs, *ps;
     id<MTLBuffer> vb[GFX_NSTREAMS], ub, ib; /* retained */
     NSUInteger voff[GFX_NSTREAMS], uoff, ioff;
+    uint32_t vbytes[GFX_NSTREAMS]; /* the draw's own vertices copied from memory: how much (0: a buffer the game keeps) */
     id<MTLTexture> tex[8]; /* retained; only for an alpha test */
     GfxSampler samp[8];
     MTLPrimitiveType prim;
@@ -1882,7 +1883,7 @@ static void draw_encode(const GfxDraw* d)
                 memcpy(v, d->data[s], d->size[s]);
                 [g_enc setVertexBuffer:buf offset:off atIndex:(NSUInteger)s];
                 if (rec)
-                    rec->vb[s] = [buf retain], rec->voff[s] = off, rec->fixed = 0;
+                    rec->vb[s] = [buf retain], rec->voff[s] = off, rec->vbytes[s] = d->size[s], rec->fixed = 0;
             }
             else
             {
@@ -4271,6 +4272,7 @@ static struct
     char chk_note[160];
     char vx_note[512];
     uint32_t skipped_sky, late_seen, late_drawn, late_cw;
+    uint32_t late_why[3]; /* the check: late ones left out - no view of their own, another target, too big or at the eye */
     SmCascade c[RT_CASCADES];
     int nc;                /* the cascades of the last maps */
     double cam[3]; /* the camera the maps' matrices are relative to (their scene's) */
@@ -4427,9 +4429,14 @@ static int rt_late_caster(Caster* cs, const double* cam)
     size_t avail = vb.length > cs->voff[ep->stream] ? vb.length - cs->voff[ep->stream] : 0;
     double lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
     int got = 0;
-    for (uint32_t i = 0; i < 64 && i < cs->n; ++i)
+    /* its own vertices when copied (they start at its first; its count of indices is not theirs - read past them,
+     * the ring's other contents made every character too big a while after start); else as indexed from the buffer */
+    uint32_t nv = cs->vbytes[ep->stream] ? cs->vbytes[ep->stream] / (uint32_t)stride : cs->n;
+    for (uint32_t i = 0; i < 64 && i < nv; ++i)
     {
-        size_t at = (size_t)((int64_t)(cs->vstart + i * (cs->n > 64 ? cs->n / 64 : 1)) + cu->vofs) * stride + cu->offset[GFX_R_POSITION];
+        uint32_t k = i * (nv > 64 ? nv / 64 : 1);
+        size_t at = cs->vbytes[ep->stream] ? (size_t)k * stride + cu->offset[GFX_R_POSITION]
+                                           : (size_t)((int64_t)(cs->vstart + k) + cu->vofs) * stride + cu->offset[GFX_R_POSITION];
         if (at + 12 > avail)
             break;
         const float* v = (const float*)(base + at);
@@ -4532,7 +4539,11 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
          * view; the zone's shaders' there went into other targets through other cameras - placed by this
          * one's, they covered the whole place */
         if (i >= g_ncasters && (!cs->has_cw || cs->target != (const void*)g_vfog_target || !rt_late_caster((Caster*)cs, cam)))
+        {
+            if (layer == 0) /* the check: why not */
+                g_sm.late_why[!cs->has_cw ? 0 : cs->target != (const void*)g_vfog_target ? 1 : 2]++;
             continue;
+        }
         /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
         if (!cs->ztest)
             continue;
@@ -6971,12 +6982,12 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
                         "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
-                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; late casters seen %u drawn %u; point lights %u (kept %u, new %u [game %u zone %u glow %u], moved at most %.2f; zone%s); terrain:%s\n", g_rtx.dr_exact,
+                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; late casters seen %u drawn %u (out: no view %u, target %u, size %u); point lights %u (kept %u, new %u [game %u zone %u glow %u], moved at most %.2f; zone%s); terrain:%s\n", g_rtx.dr_exact,
                         g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
                         g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel, g_sm.chk[0][1], g_sm.chk[0][0] + g_sm.chk[0][1],
-                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_sm.late_seen, g_sm.late_drawn, g_pl_shown, g_lt_srcs[0], g_lt_new, g_lt_newsrc[0], g_lt_newsrc[1], g_lt_newsrc[2], g_lt_move, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0,
-                    g_lt_new = 0, g_lt_move = 0, memset(g_lt_newsrc, 0, sizeof g_lt_newsrc), g_sm.skipped_sky = g_sm.late_seen = g_sm.late_drawn = 0,
+                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_sm.late_seen, g_sm.late_drawn, g_sm.late_why[0], g_sm.late_why[1], g_sm.late_why[2], g_pl_shown, g_lt_srcs[0], g_lt_new, g_lt_newsrc[0], g_lt_newsrc[1], g_lt_newsrc[2], g_lt_move, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0,
+                    g_lt_new = 0, g_lt_move = 0, memset(g_lt_newsrc, 0, sizeof g_lt_newsrc), g_sm.skipped_sky = g_sm.late_seen = g_sm.late_drawn = 0, memset(g_sm.late_why, 0, sizeof g_sm.late_why),
                     memset(g_sm.chk, 0, sizeof g_sm.chk), g_sm.chk_note[0] = 0, g_sm.vx_note[0] = 0,
                     g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
