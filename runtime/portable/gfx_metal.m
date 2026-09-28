@@ -156,7 +156,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1332,6 +1332,7 @@ typedef struct Caster
     float cw[16]; /* a fixed-function draw's clip space back to the world, its own view and projection's */
     uint8_t ztest; /* drawn with a real depth test (not the sky's: off, or always passing) */
     const void* target; /* what it was drawn into (a late one: the world's target, or another) */
+    int8_t cast;        /* a late one as a shadow caster: 0 not yet looked at, 1 yes, -1 no (rt_late_caster) */
 } Caster;
 
 /* the zone's point lights, as its shaders were given them: each draw's c11 (the light in the object's
@@ -2636,7 +2637,9 @@ static const struct
     { "rt_sun_min", offsetof(__typeof__(g_fxs), rt_sun_min), 20.0f },
     { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
-    { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 0.0f },
+    { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 1.0f },
+    { "rt_late_size", offsetof(__typeof__(g_fxs), rt_late_size), 6.0f },
+    { "rt_point_day", offsetof(__typeof__(g_fxs), rt_point_day), 0.15f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
     { "rt_sun_gain", offsetof(__typeof__(g_fxs), rt_sun_gain), 0.5f },
@@ -3472,6 +3475,7 @@ static struct
     uint32_t dr_solo, dr_solo_far;  /* the profile: frames whose camera came from a solo place; ones held */
     float sun_now[4], k_now[4];     /* toward the sun and the shadow's settings, as of the last scene */
     float game_hour;                /* the game's hour, as the sun was set from it */
+    float daylight;                 /* 0 night .. 1 day (the lamps fade by it) */
     float day;                      /* the sun's share of the light at the last scene (0: none, night) */
     uint64_t enc_pass;              /* the render pass given the structures (useResources) */
     uint32_t dr_exact, dr_pred, dr_ffp, dr_none; /* the profile: traced draws, by the camera they had */
@@ -4373,6 +4377,62 @@ static int rt_cascade(const double* vpinv, const double* cam, const double* L, d
     return 1;
 }
 
+/* Whether a draw from after the effects (a character, most) casts: its vertices through its own view into
+ * the world (a few dozen of them) - one that spans more than rt_late_size units, or sits at the camera (the
+ * player's own body in first person, what follows the camera), does not. FFXI_LATELOG=1 logs each. */
+static int rt_late_caster(Caster* cs, const double* cam)
+{
+    if (cs->cast)
+        return cs->cast > 0;
+    cs->cast = -1;
+    const GfxElem* ep = &cs->lib.vs.el[GFX_R_POSITION];
+    if (!cs->has_cw || !cs->ub || !ep->used || cs->lib.vs.rhw)
+        return 0;
+    const GfxU* cu = (const GfxU*)((const uint8_t*)[cs->ub contents] + cs->uoff);
+    id<MTLBuffer> vb = cs->vb[ep->stream];
+    int stride = cu->stride[ep->stream];
+    if (!vb || stride <= 0 || vb.storageMode != MTLStorageModeShared)
+        return 0;
+    const uint8_t* base = (const uint8_t*)[vb contents] + cs->voff[ep->stream];
+    size_t avail = vb.length > cs->voff[ep->stream] ? vb.length - cs->voff[ep->stream] : 0;
+    double lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
+    int got = 0;
+    for (uint32_t i = 0; i < 64 && i < cs->n; ++i)
+    {
+        size_t at = (size_t)((int64_t)(cs->vstart + i * (cs->n > 64 ? cs->n / 64 : 1)) + cu->vofs) * stride + cu->offset[GFX_R_POSITION];
+        if (at + 12 > avail)
+            break;
+        const float* v = (const float*)(base + at);
+        double c[4], w[4];
+        for (int j = 0; j < 4; ++j)
+            c[j] = v[0] * cu->wvp[j] + v[1] * cu->wvp[4 + j] + v[2] * cu->wvp[8 + j] + cu->wvp[12 + j];
+        for (int j = 0; j < 4; ++j)
+            w[j] = c[0] * cs->cw[j] + c[1] * cs->cw[4 + j] + c[2] * cs->cw[8 + j] + c[3] * cs->cw[12 + j];
+        if (fabs(w[3]) < 1e-9)
+            continue;
+        for (int j = 0; j < 3; ++j)
+        {
+            double x = w[j] / w[3];
+            lo[j] = fmin(lo[j], x), hi[j] = fmax(hi[j], x);
+        }
+        got++;
+    }
+    if (got < 3)
+        return 0;
+    double size = fmax(hi[0] - lo[0], fmax(hi[1] - lo[1], hi[2] - lo[2]));
+    double mid[3] = { (lo[0] + hi[0]) * 0.5 - cam[0], (lo[1] + hi[1]) * 0.5 - cam[1], (lo[2] + hi[2]) * 0.5 - cam[2] };
+    double dcam = sqrt(mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]);
+    float maxs = g_fxs.rt_late_size > 0.0f ? g_fxs.rt_late_size : 6.0f;
+    int ok = size < maxs && dcam > 0.8;
+    static int logon = -1;
+    if (logon < 0)
+        logon = getenv("FFXI_LATELOG") && getenv("FFXI_LATELOG")[0] == '1';
+    if (logon)
+        fprintf(stderr, "[recomp] gfx: late caster n %u size %.1f at %.1f from the camera: %s\n", cs->n, size, dcam, ok ? "casts" : "not");
+    cs->cast = ok ? 1 : -1;
+    return ok;
+}
+
 /* the frame's casters into one cascade's map (rel: its camera's clip space to the world less the
  * camera's place cam) */
 static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel, const double* cam)
@@ -4415,7 +4475,7 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         /* of what came after the effects, only the fixed-function draws (the characters): they carry their own
          * view; the zone's shaders' there went into other targets through other cameras - placed by this
          * one's, they covered the whole place */
-        if (i >= g_ncasters && (!cs->has_cw || cs->target != (const void*)g_vfog_target))
+        if (i >= g_ncasters && (!cs->has_cw || cs->target != (const void*)g_vfog_target || !rt_late_caster((Caster*)cs, cam)))
             continue;
         /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
         if (!cs->ztest)
@@ -4458,7 +4518,8 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
                 }
                 if (inv)
                     x -= cam[0], y -= cam[1], z -= cam[2];
-                if (sky || x * x + y * y + z * z < 4.0)
+                /* (characters too sit at the eye - skinned into the camera's frame - but are small: measured) */
+                if ((sky || x * x + y * y + z * z < 4.0) && !rt_late_caster((Caster*)cs, cam))
                 {
                     g_sm.skipped_sky += layer == 0;
                     continue;
@@ -5219,7 +5280,9 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
             u.lc[n][3] = 0.0f;
             n++;
         }
-        u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point;
+        /* by day the lamps' light is a small part of what lights the street (rt_point_day of it at full day) */
+        float day = g_fxs.rt_sun_elev != 0.0f ? 1.0f : g_rtx.daylight;
+        u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point * (1.0f + (fminf(fmaxf(g_fxs.rt_point_day, 0.0f), 1.0f) - 1.0f) * day);
         g_pl_shown = n;
         {
             uint32_t live = 0;
@@ -6718,6 +6781,7 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                     u.sunw[0] = (float)(cos(e) * cos(az)), u.sunw[1] = (float)-sin(e), u.sunw[2] = 0.0f, u.sunw[3] = 1.0f;
                     float fade = fminf(fmaxf((float)(el / (25.0 * M_PI / 180.0)), 0.0f), 1.0f);
                     strength *= (night ? g_fxs.rt_moon : 1.0f) * fade * fade * (3.0f - 2.0f * fade);
+                    g_rtx.daylight = night ? 0.0f : fade * fade * (3.0f - 2.0f * fade);
                     g_rtx.game_hour = (float)h;
                 }
                 memcpy(g_rtx.sun_now, u.sunw, 16);
