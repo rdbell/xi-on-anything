@@ -2460,12 +2460,12 @@ static const struct
     { "rt_gi", offsetof(__typeof__(g_fxs), rt_gi), 0.35f },
     { "rt_gi_radius", offsetof(__typeof__(g_fxs), rt_gi_radius), 8.0f },
     { "rt_soft", offsetof(__typeof__(g_fxs), rt_soft), 0.3f },
-    { "rt_point", offsetof(__typeof__(g_fxs), rt_point), 1.5f },
+    { "rt_point", offsetof(__typeof__(g_fxs), rt_point), 1.0f },
     { "rt_point_range", offsetof(__typeof__(g_fxs), rt_point_range), 2.0f },
     { "rt_glow", offsetof(__typeof__(g_fxs), rt_glow), 1.0f },
     { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.4f },
     { "rt_point_far", offsetof(__typeof__(g_fxs), rt_point_far), 60.0f },
-    { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 24.0f },
+    { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 48.0f },
     { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 0.35f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
@@ -4605,6 +4605,15 @@ static const char DS_MSL[] =
 
 /* the game's point lights this frame and the last (the pass lights with the last complete frame's) */
 enum { RT_LIGHTS = 128 };
+/* the point lights kept in the world (rt_defer_pass) */
+enum { RT_LKEEP = 256 };
+static struct
+{
+    double p[3];
+    float c[3], r, fade;
+    uint64_t seen, fade_serial;
+    int live;
+} g_lt[RT_LKEEP];
 static uint32_t g_pl_shown; /* the profile: lights the last pass lit with */
 static struct
 {
@@ -4815,48 +4824,87 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 u.lc[n][3] = 1.0f; /* (a glow's: the debug view marks it apart) */
                 n++;
             }
-        /* only what can light the view: within rt_point_far of the camera and not wholly behind it; the
-         * nearest rt_point_max; their colour toward white (rt_point_sat of its tint) */
+        /* The lights kept in the world across frames (g_lt): what this frame gave merged in by place - a
+         * light keeps shining while the meshes that carry it come and go, fading in over a quarter second
+         * when first seen and out over a second when not seen for two. Each is weighed by how far it is
+         * (full within rt_point_far's first 70%, none past it), the strongest rt_point_max chosen: nothing
+         * switches on or off at once. Colour toward white (rt_point_sat of its tint). */
+        for (uint32_t i = 0; i < n; ++i)
         {
-            float fwd[3] = { 0, 0, 0 };
+            double wp[3] = { u.lp[i][0] + g_sm.cam[0], u.lp[i][1] + g_sm.cam[1], u.lp[i][2] + g_sm.cam[2] };
+            int k = -1;
+            for (int t = 0; t < RT_LKEEP; ++t)
             {
-                float c[4] = { 0, 0, 0.5f, 1 }, w[4];
-                for (int j = 0; j < 4; ++j)
-                    w[j] = c[2] * g_sm.rel[8 + j] + c[3] * g_sm.rel[12 + j];
-                float l = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * (w[3] < 0 ? -1.0f : 1.0f);
-                if (fabsf(l) > 1e-6f)
-                    fwd[0] = w[0] / l, fwd[1] = w[1] / l, fwd[2] = w[2] / l;
-            }
-            float far = g_fxs.rt_point_far > 0.0f ? g_fxs.rt_point_far : 60.0f, key[RT_LIGHTS];
-            uint32_t m = 0;
-            for (uint32_t i = 0; i < n; ++i)
-            {
-                float* lp = u.lp[i];
-                float d2 = lp[0] * lp[0] + lp[1] * lp[1] + lp[2] * lp[2];
-                float ahead = lp[0] * fwd[0] + lp[1] * fwd[1] + lp[2] * fwd[2];
-                if (sqrtf(d2) - lp[3] > far || ahead < -lp[3])
+                if (!g_lt[t].live)
                     continue;
-                memcpy(u.lp[m], u.lp[i], 16), memcpy(u.lc[m], u.lc[i], 16), key[m] = d2;
-                m++;
-            }
-            for (uint32_t i = 1; i < m; ++i) /* nearest first */
-                for (uint32_t j = i; j > 0 && key[j] < key[j - 1]; --j)
+                double dx = g_lt[t].p[0] - wp[0], dy = g_lt[t].p[1] - wp[1], dz = g_lt[t].p[2] - wp[2];
+                if (dx * dx + dy * dy + dz * dz < 1.0)
                 {
-                    float t[4], k = key[j];
-                    key[j] = key[j - 1], key[j - 1] = k;
-                    memcpy(t, u.lp[j], 16), memcpy(u.lp[j], u.lp[j - 1], 16), memcpy(u.lp[j - 1], t, 16);
-                    memcpy(t, u.lc[j], 16), memcpy(u.lc[j], u.lc[j - 1], 16), memcpy(u.lc[j - 1], t, 16);
+                    k = t;
+                    break;
                 }
-            uint32_t cap = g_fxs.rt_point_max >= 1.0f ? (uint32_t)g_fxs.rt_point_max : 24;
-            n = m < cap ? m : cap;
-            float sat = fminf(fmaxf(g_fxs.rt_point_sat, 0.0f), 1.0f);
-            for (uint32_t i = 0; i < n; ++i)
-            {
-                float* c = u.lc[i];
-                float y = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
-                for (int j = 0; j < 3; ++j)
-                    c[j] = y + (c[j] - y) * sat;
             }
+            if (k < 0)
+                for (int t = 0; t < RT_LKEEP && k < 0; ++t)
+                    if (!g_lt[t].live)
+                        k = t, memset(&g_lt[t], 0, sizeof g_lt[t]), g_lt[t].live = 1, memcpy(g_lt[t].p, wp, sizeof wp),
+                        memcpy(g_lt[t].c, u.lc[i], 12), g_lt[t].r = u.lp[i][3];
+            if (k < 0)
+                continue;
+            /* place and colour settle slowly (a glow's middle wobbles with its billboard) */
+            for (int j = 0; j < 3; ++j)
+                g_lt[k].p[j] += (wp[j] - g_lt[k].p[j]) * 0.1, g_lt[k].c[j] += (u.lc[i][j] - g_lt[k].c[j]) * 0.1f;
+            g_lt[k].r += (u.lp[i][3] - g_lt[k].r) * 0.1f;
+            g_lt[k].seen = g_serial;
+        }
+        float far = g_fxs.rt_point_far > 0.0f ? g_fxs.rt_point_far : 60.0f, key[RT_LKEEP];
+        int idx[RT_LKEEP], m = 0;
+        for (int t = 0; t < RT_LKEEP; ++t)
+        {
+            if (!g_lt[t].live)
+                continue;
+            int on = g_lt[t].seen + 120 >= g_serial;
+            if (g_lt[t].fade_serial != g_serial)
+                g_lt[t].fade_serial = g_serial, g_lt[t].fade = fminf(fmaxf(g_lt[t].fade + (on ? 0.07f : -0.017f), 0.0f), 1.0f);
+            if (!on && g_lt[t].fade <= 0.0f)
+            {
+                g_lt[t].live = 0;
+                continue;
+            }
+            double dx = g_lt[t].p[0] - g_sm.cam[0], dy = g_lt[t].p[1] - g_sm.cam[1], dz = g_lt[t].p[2] - g_sm.cam[2];
+            float d = (float)sqrt(dx * dx + dy * dy + dz * dz) - g_lt[t].r;
+            float wd = 1.0f - fminf(fmaxf((d - 0.7f * far) / (0.3f * far), 0.0f), 1.0f);
+            float wgt = wd * g_lt[t].fade;
+            if (wgt <= 0.0f)
+                continue;
+            key[m] = wgt / (1.0f + fmaxf(d, 0.0f) * 0.02f), idx[m++] = t;
+        }
+        for (int a = 1; a < m; ++a) /* strongest first */
+            for (int b = a; b > 0 && key[b] > key[b - 1]; --b)
+            {
+                float kk = key[b]; key[b] = key[b - 1], key[b - 1] = kk;
+                int ii = idx[b]; idx[b] = idx[b - 1], idx[b - 1] = ii;
+            }
+        uint32_t cap = g_fxs.rt_point_max >= 1.0f ? (uint32_t)g_fxs.rt_point_max : 48;
+        if (cap > RT_LIGHTS)
+            cap = RT_LIGHTS;
+        float sat = fminf(fmaxf(g_fxs.rt_point_sat, 0.0f), 1.0f);
+        n = 0;
+        for (int a = 0; a < m && n < cap; ++a)
+        {
+            const __typeof__(g_lt[0])* L = &g_lt[idx[a]];
+            double dx = L->p[0] - g_sm.cam[0], dy = L->p[1] - g_sm.cam[1], dz = L->p[2] - g_sm.cam[2];
+            float d = (float)sqrt(dx * dx + dy * dy + dz * dz) - L->r;
+            float wd = 1.0f - fminf(fmaxf((d - 0.7f * far) / (0.3f * far), 0.0f), 1.0f);
+            /* the last few of the chosen fade toward the cap, so one crossing it is not a switch */
+            float wc = cap > 4 && n + 4 >= cap ? (float)(cap - n) / 5.0f : 1.0f;
+            float k = wd * L->fade * wc;
+            u.lp[n][0] = (float)dx, u.lp[n][1] = (float)dy, u.lp[n][2] = (float)dz, u.lp[n][3] = L->r;
+            float y = 0.2126f * L->c[0] + 0.7152f * L->c[1] + 0.0722f * L->c[2];
+            for (int j = 0; j < 3; ++j)
+                u.lc[n][j] = (y + (L->c[j] - y) * sat) * k;
+            u.lc[n][3] = 0.0f;
+            n++;
         }
         u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point;
         g_pl_shown = n;
