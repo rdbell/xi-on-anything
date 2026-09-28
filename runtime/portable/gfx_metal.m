@@ -4412,12 +4412,16 @@ static const char DS_MSL[] =
     "  float4 w = d.ivp * float4(ndc.x, -ndc.y, zn, 1.0);\n"
     "  return w.xyz / w.w;\n"
     "}\n"
+    /* (the offset off the face and the depth bias grow as the sun grazes it - tan of its angle, 1..6 -
+     * so a wall the low sun skims does not shade itself in the fine near map yet not in the coarser) */
     "static float ds_look(constant DS& d, depth2d_array<float> t, int c, float3 p, float3 n) {\n"
     "  constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
-    "  float4 q = d.s[c] * float4(p + n * d.cs[c].x, 1.0);\n"
+    "  float ndl = clamp(abs(dot(n, d.sun.xyz)), 0.05, 1.0);\n"
+    "  float sl = clamp(sqrt(1.0 - ndl * ndl) / ndl, 1.0, 6.0);\n"
+    "  float4 q = d.s[c] * float4(p + n * d.cs[c].x * sl, 1.0);\n"
     "  if (any(abs(q.xy) > 0.98) || q.z <= 0.0 || q.z >= 1.0) return -1.0;\n"
     "  float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
-    "  float z = q.z - d.cs[c].z, st = d.cs[c].y, s = 0.0;\n"
+    "  float z = q.z - d.cs[c].z * sl, st = d.cs[c].y, s = 0.0;\n"
     "  for (int j = 0; j < 4; ++j)\n"
     "    for (int i = 0; i < 4; ++i)\n"
     "      s += t.sample_compare(cmp, uv + (float2(i, j) - 1.5) * st, uint(c), z);\n"
