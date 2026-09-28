@@ -130,6 +130,11 @@ static int g_ov_pass;          /* the pass being encoded has them */
 static int g_ov_reset = 1;     /* cleared when next attached (s 0, t 1) */
 static uint64_t g_ov_serial;   /* the frame a draw last went into them */
 static uint64_t g_ov_done;     /* the frame they were last put over the image */
+/* HDR out (hdr_output): how much brighter than shown each pixel of the world really is (the tone rolled it
+ * into white; 1: as shown), and where the world was drawn onto the screen */
+static id<MTLTexture> g_ov_b;
+static struct { const GfxTex* target; float rect[4], uv[4]; uint64_t serial; } g_wmap;
+static id<MTLTexture> ov_boost(id<MTLTexture> ct);
 /* the target the fog pass last put its fog into: the world's draws there are drawn clear (vfog) */
 static const GfxTex* g_vfog_target;
 static uint32_t g_rt_face, g_rt_level;
@@ -151,7 +156,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1693,6 +1698,41 @@ void gfx_draw(const GfxDraw* d)
         end_pass(), g_ov_target = g_rt, g_ov_reset = 1; /* the world's layers go with this target now */
     if (d->mrt && g_ov_target == g_rt)
         g_ov_serial = g_serial;
+    /* where the world's image goes onto another target (the screen): its rectangle and the image's part in it,
+     * from the screen-space quad's vertices (HDR out) */
+    if (g_ov_target && g_rt != g_ov_target && d->vs.rhw && d->tex[0] == g_ov_target)
+    {
+        const GfxElem* ep = &d->vs.el[GFX_R_POSITION];
+        const GfxElem* et = &d->vs.el[GFX_R_TEXCOORD0];
+        if (ep->used && et->used && ep->stream == et->stream)
+        {
+            int st = ep->stream, stride = d->u.stride[st];
+            const uint8_t* base = NULL;
+            uint32_t nv = 0;
+            if (d->data[st] && stride > 0)
+                base = (const uint8_t*)d->data[st], nv = d->size[st] / (uint32_t)stride;
+            if (base && nv >= 3 && nv <= 64)
+            {
+                float mn[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, mx[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+                for (uint32_t i = 0; i < nv; ++i)
+                {
+                    const float* pp = (const float*)(base + (size_t)i * stride + d->u.offset[GFX_R_POSITION]);
+                    const float* tt = (const float*)(base + (size_t)i * stride + d->u.offset[GFX_R_TEXCOORD0]);
+                    float v[4] = { pp[0], pp[1], tt[0], tt[1] };
+                    for (int j = 0; j < 4; ++j)
+                        mn[j] = fminf(mn[j], v[j]), mx[j] = fmaxf(mx[j], v[j]);
+                }
+                g_wmap.target = g_rt, g_wmap.serial = g_serial;
+                g_wmap.rect[0] = mn[0], g_wmap.rect[1] = mn[1], g_wmap.rect[2] = mx[0] - mn[0], g_wmap.rect[3] = mx[1] - mn[1];
+                g_wmap.uv[0] = mn[2], g_wmap.uv[1] = mn[3], g_wmap.uv[2] = mx[2] - mn[2], g_wmap.uv[3] = mx[3] - mn[3];
+                static int told;
+                if (!told++)
+                    fprintf(stderr, "[recomp] gfx: HDR out: the world onto %ux%u at %.0f,%.0f %.0fx%.0f (image %.3f,%.3f %.3fx%.3f)\n",
+                        g_rt->w, g_rt->h, g_wmap.rect[0], g_wmap.rect[1], g_wmap.rect[2], g_wmap.rect[3], g_wmap.uv[0], g_wmap.uv[1],
+                        g_wmap.uv[2], g_wmap.uv[3]);
+            }
+        }
+    }
     if (g_fxs.hide_ui != 0.0f && d->vs.rhw && !(d->tex[0] && d->tex[0]->use == GFX_USE_RT))
         return;
     uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
@@ -1967,6 +2007,46 @@ static const char CLEAR_MSL[] =
     "}\n";
 
 static id<MTLLibrary> g_util;
+
+/* HDR out: the screen in extended linear sRGB - the game's colours taken linear, and where the world shows
+ * as the lighting left it (the screen's pixel still the world's: not under the interface) its highlights
+ * brightened past white by what the tone rolled off, up to the peak */
+static const char EDR_MSL[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct PO { float4 pos [[position]]; float2 uv; };\n"
+    "struct PE { float4 rect; float4 uv; float4 k; };\n" /* k: sharpen, on, peak, - */
+    "vertex PO edr_vs(uint vid [[vertex_id]]) {\n"
+    "  PO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(t.x, 1.0 - t.y);\n"
+    "  return o;\n"
+    "}\n"
+    "static float3 lin(float3 c) { return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c <= 0.04045); }\n"
+    "fragment float4 edr_fs(PO in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
+    "                       constant PE& e [[buffer(0)]], texture2d<float> w [[texture(1)]], texture2d<float> b [[texture(2)]]) {\n"
+    "  float2 tx = 1.0 / float2(t.get_width(), t.get_height());\n"
+    "  float3 c = t.sample(s, in.uv).rgb;\n"
+    "  if (e.k.x > 0.0) {\n"
+    "    float3 n = t.sample(s, in.uv - float2(0, tx.y)).rgb, so = t.sample(s, in.uv + float2(0, tx.y)).rgb;\n"
+    "    float3 wv = t.sample(s, in.uv - float2(tx.x, 0)).rgb, ea = t.sample(s, in.uv + float2(tx.x, 0)).rgb;\n"
+    "    float3 mn = min(c, min(min(n, so), min(wv, ea))), mx = max(c, max(max(n, so), max(wv, ea)));\n"
+    "    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));\n"
+    "    float3 lobe = -amp * mix(0.125, 0.2, saturate(e.k.x));\n"
+    "    c = saturate((c + (n + so + wv + ea) * lobe) / (1.0 + 4.0 * lobe));\n"
+    "  }\n"
+    "  float3 l = lin(saturate(c));\n"
+    "  if (e.k.y > 0.0) {\n"
+    "    float2 px = in.uv / tx;\n"
+    "    float2 r = (px - e.rect.xy) / max(e.rect.zw, float2(1.0));\n"
+    "    if (all(r >= 0.0) && all(r <= 1.0)) {\n"
+    "      float2 wuv = e.uv.xy + r * e.uv.zw;\n"
+    "      float3 wc = w.sample(s, wuv).rgb;\n"
+    "      if (max3(abs(wc.r - c.r), abs(wc.g - c.g), abs(wc.b - c.b)) < 0.06) l *= min(b.sample(s, wuv).r, e.k.z);\n"
+    "    }\n"
+    "  }\n"
+    "  return float4(l, 1.0);\n"
+    "}\n";
+static id<MTLRenderPipelineState> g_edr_pipe;
+static int g_edr_on;
 
 static id<MTLRenderPipelineState> clear_pipeline(uint32_t flags)
 {
@@ -2566,6 +2646,8 @@ static const struct
     { "hdr_black", offsetof(__typeof__(g_fxs), hdr_black), 0.02f },
     { "hdr_white", offsetof(__typeof__(g_fxs), hdr_white), 1.6f },
     { "hdr_knee", offsetof(__typeof__(g_fxs), hdr_knee), 0.8f },
+    { "hdr_output", offsetof(__typeof__(g_fxs), hdr_output), 1.0f },
+    { "hdr_peak", offsetof(__typeof__(g_fxs), hdr_peak), 3.0f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4762,6 +4844,8 @@ static const char DS_MSL[] =
     "}\n"
     /* the tone: exposure; contrast about the middle; the black level taken off; above the knee the rest of
      * the range up to the white level rolled off into what is left below white */
+    "struct DSOut { float4 c [[color(0)]]; float b [[color(1)]]; };\n"
+    "static float ds_luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
     "static float3 ds_tone(constant DS& d, float3 x) {\n"
     "  x = max(x * d.tm.x, 0.0);\n"
     "  x = 0.5 * pow(x / 0.5, float3(d.tm.y));\n"
@@ -4773,22 +4857,30 @@ static const char DS_MSL[] =
     "  return saturate(y);\n"
     "}\n"
     /* the lit image with the see-through layer over it (the world's layers, rt_mrt: pl.w) */
-    "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
+    "fragment DSOut ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
     "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
     "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
     "                      texture2d<float> fd [[texture(5)]], texture2d<uint> st [[texture(6)]],\n"
     "                      texture2d<float> ls [[texture(7)]], texture2d<float> lt [[texture(8)]],\n"
     "                      texture2d<float> nt [[texture(9)]]) {\n"
     "  float4 c = ds_lit(in, d, dep, sm, src, rsm, ft, fd, st, nt);\n"
-    "  if (d.sg.w > 0.0 && d.k.z <= 0.0) c.rgb = ds_tone(d, c.rgb);\n"
-    "  if (d.pl.w > 0.0) { uint2 p = uint2(in.pos.xy); c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; }\n"
-    "  return c;\n"
+    "  float b = 1.0;\n"
+    "  if (d.sg.w > 0.0 && d.k.z <= 0.0) {\n"
+    "    float3 x = c.rgb; c.rgb = ds_tone(d, c.rgb);\n"
+    /* the highlight the tone rolled into white: how much brighter it is than shown */
+    "    b = max(ds_luma(max(x * d.tm.x, 0.0)) / max(ds_luma(c.rgb), 1e-3), 1.0);\n"
+    "  }\n"
+    "  if (d.pl.w > 0.0) {\n"
+    "    uint2 p = uint2(in.pos.xy); float3 t = lt.read(p).rgb;\n"
+    "    c.rgb = c.rgb * t + ls.read(p).rgb; b = 1.0 + (b - 1.0) * ds_luma(t);\n"
+    "  }\n"
+    "  DSOut o; o.c = c; o.b = b; return o;\n"
     "}\n"
     /* the layers alone, over the image as it is (no lighting this frame) */
-    "fragment float4 ds_comp(DO in [[stage_in]], texture2d<float> src [[texture(2)]], texture2d<float> ls [[texture(7)]],\n"
+    "fragment DSOut ds_comp(DO in [[stage_in]], texture2d<float> src [[texture(2)]], texture2d<float> ls [[texture(7)]],\n"
     "                        texture2d<float> lt [[texture(8)]]) {\n"
     "  uint2 p = uint2(in.pos.xy); float4 c = src.read(p);\n"
-    "  c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; return c;\n"
+    "  c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; DSOut o; o.c = c; o.b = 1.0; return o;\n"
     "}\n";
 
 /* the game's point lights this frame and the last (the pass lights with the last complete frame's) */
@@ -4877,6 +4969,7 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.pixelFormat = ct.pixelFormat;
         (void)ca; /* the colour written whole (the pass reads a copy of it) */
+        pd.colorAttachments[1].pixelFormat = MTLPixelFormatR16Float; /* the highlight (HDR out) */
         NSError* err = nil;
         g_sm.dpipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!g_sm.dpipe)
@@ -5192,6 +5285,10 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
     rp.colorAttachments[0].texture = ct;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[1].texture = ov_boost(ct); /* (1 outside the scene's viewport) */
+    rp.colorAttachments[1].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[1].clearColor = MTLClearColorMake(1, 1, 1, 1);
+    rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:g_sm.dpipe];
     [e setViewport:(MTLViewport){ vp[0], vp[1], vp[2], vp[3], 0, 1 }];
@@ -5254,6 +5351,21 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
 
 static void rt_cam_log(const char* what);
 
+/* the highlight target for the world's image ct (HDR out), made again when its size changes */
+static id<MTLTexture> ov_boost(id<MTLTexture> ct)
+{
+    if (!g_ov_b || g_ov_b.width != ct.width || g_ov_b.height != ct.height)
+    {
+        [g_ov_b release];
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:ct.width
+                                                                                     height:ct.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        g_ov_b = [g_dev newTextureWithDescriptor:td];
+    }
+    return g_ov_b;
+}
+
 /* the world's layers over its image as it is (the lighting did not run this frame) */
 static void rt_world_composite(void)
 {
@@ -5272,6 +5384,7 @@ static void rt_world_composite(void)
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         id<MTLFunction> vf = [g_sm.dlib newFunctionWithName:@"ds_vs"], ff = [g_sm.dlib newFunctionWithName:@"ds_comp"];
         pd.vertexFunction = vf, pd.fragmentFunction = ff, pd.colorAttachments[0].pixelFormat = ct.pixelFormat;
+        pd.colorAttachments[1].pixelFormat = MTLPixelFormatR16Float;
         NSError* err = nil;
         cp = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         cfmt = ct.pixelFormat;
@@ -5296,6 +5409,10 @@ static void rt_world_composite(void)
     rp.colorAttachments[0].texture = ct;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[1].texture = ov_boost(ct);
+    rp.colorAttachments[1].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[1].clearColor = MTLClearColorMake(1, 1, 1, 1);
+    rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:cp];
     [e setFragmentTexture:g_sm.ccopy atIndex:2];
@@ -6821,6 +6938,34 @@ void gfx_present(GfxTex* bb)
     @autoreleasepool
     {
         flush_pass();
+        /* HDR out: the screen extended-range (hdr_output), switched as the setting changes */
+        int want = g_fxs.hdr_output != 0.0f;
+        if (g_layer && want != g_edr_on)
+        {
+            if (want && !g_edr_pipe)
+            {
+                id<MTLLibrary> lib = compile(EDR_MSL);
+                if (lib)
+                {
+                    MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+                    id<MTLFunction> vf = [lib newFunctionWithName:@"edr_vs"], ff = [lib newFunctionWithName:@"edr_fs"];
+                    pd.vertexFunction = vf, pd.fragmentFunction = ff;
+                    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+                    g_edr_pipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+                    [vf release], [ff release], [pd release], [lib release];
+                }
+            }
+            if (!want || g_edr_pipe)
+            {
+                CGColorSpaceRef cs = CGColorSpaceCreateWithName(want ? kCGColorSpaceExtendedLinearSRGB : kCGColorSpaceSRGB);
+                g_layer.pixelFormat = want ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+                g_layer.wantsExtendedDynamicRangeContent = want ? YES : NO;
+                g_layer.colorspace = cs;
+                CGColorSpaceRelease(cs);
+                g_edr_on = want;
+                fprintf(stderr, "[recomp] gfx: HDR out %s\n", want ? "on (extended linear sRGB)" : "off");
+            }
+        }
         if (g_layer && bb)
         {
             int pw = 0, ph = 0;
@@ -6832,7 +6977,30 @@ void gfx_present(GfxTex* bb)
             id<CAMetalDrawable> drawable = [g_layer nextDrawable];
             if (gfx_profiling)
                 g_prof.drawable_ns += gfx_now_ns() - t0;
-            if (drawable)
+            if (drawable && g_edr_on && g_edr_pipe && drawable.texture.pixelFormat == MTLPixelFormatRGBA16Float)
+            {
+                MTLRenderPassDescriptor* p = [MTLRenderPassDescriptor renderPassDescriptor];
+                p.colorAttachments[0].texture = drawable.texture;
+                p.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                p.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:p];
+                struct { float rect[4], uv[4], k[4]; } pe;
+                memset(&pe, 0, sizeof pe);
+                int on = g_wmap.target == bb && g_wmap.serial == g_serial && g_ov_b && g_ov_target && g_ov_done == g_serial;
+                memcpy(pe.rect, g_wmap.rect, 16), memcpy(pe.uv, g_wmap.uv, 16);
+                pe.k[0] = g_fxs.fx != 0.0f ? g_fxs.sharpen : 0.0f, pe.k[1] = on ? 1.0f : 0.0f, pe.k[2] = fmaxf(g_fxs.hdr_peak, 1.0f);
+                [e setRenderPipelineState:g_edr_pipe];
+                [e setFragmentBytes:&pe length:sizeof pe atIndex:0];
+                [e setFragmentTexture:bb->view atIndex:0];
+                [e setFragmentTexture:on ? g_ov_target->tex : bb->view atIndex:1];
+                [e setFragmentTexture:on ? g_ov_b : bb->view atIndex:2];
+                [e setFragmentSamplerState:g_present_samp atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [e endEncoding];
+                [cmd() presentDrawable:drawable];
+                bb->used = g_serial;
+            }
+            else if (drawable)
             {
                 MTLRenderPassDescriptor* p = [MTLRenderPassDescriptor renderPassDescriptor];
                 p.colorAttachments[0].texture = drawable.texture;
