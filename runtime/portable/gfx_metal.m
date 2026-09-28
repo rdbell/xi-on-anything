@@ -156,7 +156,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_decal, anim_smooth, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1283,7 +1283,7 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
         k.lib.vs.rt = k.lib.fs.rt = 1;
     /* the interface onto the world before its lighting: marking the stencil (rt_defer) */
     if (g_ov_pass)
-        k.lib.fs.mrt = d->mrt == 1 ? 1 : d->mrt == 2 ? (d->pipe.blend ? 2 : 3) : 4;
+        k.lib.fs.mrt = d->mrt == 1 ? 1 : d->mrt == 2 ? (d->pipe.blend ? 2 : 3) : 4; /* (3: a decal, into the image) */
     int ov = !g_ov_pass && d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment();
     if (ov)
         k.lib.fs.overlay = 1;
@@ -2639,6 +2639,8 @@ static const struct
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
     { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 1.0f },
     { "rt_late_size", offsetof(__typeof__(g_fxs), rt_late_size), 6.0f },
+    { "rt_decal", offsetof(__typeof__(g_fxs), rt_decal), 1.0f },
+    { "anim_smooth", offsetof(__typeof__(g_fxs), anim_smooth), 1.0f },
     { "rt_point_day", offsetof(__typeof__(g_fxs), rt_point_day), 0.15f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
@@ -4472,6 +4474,32 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             continue;
         if (i >= g_ncasters && layer == 0)
             g_sm.late_seen++;
+        if (layer == 0 && !access("/tmp/ffxi_animlog", F_OK) && cs->ub && cs->vb[0]) /* the check: how often each moves */
+        {
+            static FILE* af;
+            if (!af)
+                af = fopen("/tmp/ffxi_anim.txt", "w");
+            const GfxU* cu = (const GfxU*)((const uint8_t*)[cs->ub contents] + cs->uoff);
+            uint64_t hu = 1469598103934665603ull, hv = 1469598103934665603ull;
+            const uint8_t* ub = (const uint8_t*)cu->vsc[4];
+            for (int j = 0; j < 16 * 20; ++j)
+                hu = (hu ^ ub[j]) * 1099511628211ull;
+            uint64_t hw = 1469598103934665603ull;
+            const uint8_t* wb = cs->lib.vs.prog ? (const uint8_t*)cu->vsc[0] : (const uint8_t*)cu->wvp;
+            for (int j = 0; j < 64; ++j)
+                hw = (hw ^ wb[j]) * 1099511628211ull;
+            if (cs->vb[0].storageMode == MTLStorageModeShared)
+            {
+                const uint8_t* vp = (const uint8_t*)[cs->vb[0] contents] + cs->voff[0];
+                size_t len = cs->vb[0].length - cs->voff[0];
+                for (size_t j = 0; j < len && j < 4096; ++j)
+                    hv = (hv ^ vp[j]) * 1099511628211ull;
+            }
+            if (af)
+                fprintf(af, "%llu %p+%lu n %u vs %d cw %d u %016llx v %016llx at %u w %016llx\n", (unsigned long long)g_serial, (void*)cs->vb[0],
+                    (unsigned long)cs->voff[0], cs->n, cs->lib.vs.prog != 0, cs->has_cw, (unsigned long long)hu, (unsigned long long)hv,
+                    cs->vstart, (unsigned long long)hw);
+        }
         /* of what came after the effects, only the fixed-function draws (the characters): they carry their own
          * view; the zone's shaders' there went into other targets through other cameras - placed by this
          * one's, they covered the whole place */
@@ -4876,7 +4904,9 @@ static const char DS_MSL[] =
     /* darkened by the shadow's share, and brightened where the sun reaches (sg.x of its strength) - the fog's
      * share of the surface alone either way */
     "  float fade = 1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist);\n"
-    "  float3 oc = col.rgb * (1.0 - a * f + d.sg.x * d.k.x * v * fade * f);\n"
+    /* (the sun's brightening less on what is bright already - sand, snow at noon: it had nowhere to go but white) */
+    "  float3 room = saturate(2.0 * (1.0 - col.rgb));\n"
+    "  float3 oc = col.rgb * (1.0 - a * f + room * (d.sg.x * d.k.x * v * fade * f));\n"
     /* the bounce light where the sun does not reach (in full sun it is little beside it) */
     "  oc += col.rgb * gi * f * (1.0 - 0.75 * v);\n"
     /* the lamps and torches: each lights what faces it within its range, falling off smoothly */
@@ -5307,12 +5337,14 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
         [b endEncoding];
     }
     /* the stencil (the interface's marks, bit 0x80) read through a view of the depth */
-    id<MTLTexture> sview = nil;
-    if (dep.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && (dep.usage & MTLTextureUsagePixelFormatView))
-        sview = [dep newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-    u.pl[2] = sview ? 1.0f : 0.0f;
     /* the world's layers over it, when the world went into them this frame */
     int layers = g_ov_serial == g_serial && g_ov_target && g_ov_target->tex == ct && g_ov_s;
+    /* (with the layers the interface is in them, never marked: the stencil is the game's own then - its decals
+     * write it - and was taken for the interface's, whole decal quads left unlit) */
+    id<MTLTexture> sview = nil;
+    if (!layers && dep.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && (dep.usage & MTLTextureUsagePixelFormatView))
+        sview = [dep newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    u.pl[2] = sview ? 1.0f : 0.0f;
     u.pl[3] = layers ? 1.0f : 0.0f;
     /* (too large to pass inline: in this frame's ring) */
     id<MTLBuffer> ub;

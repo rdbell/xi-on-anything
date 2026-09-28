@@ -202,7 +202,7 @@ typedef struct GfxDraw
                      * world's drawn after the scene's effects ran (characters, some frames): traced
                      * with the next frame's scene (the back end's ray tracing), no shadow map */
     uint8_t overlay; /* 2D onto the world's target before the world is lit (nameplates, text) */
-    uint8_t mrt;     /* onto the world's target before it is lit: 1 solid, 2 see-through or 2D (rt_mrt) */
+    uint8_t mrt;     /* onto the world's target before it is lit: 1 solid, 2 see-through or 2D, 3 a decal (the image alone) (rt_mrt) */
     uint8_t receive; /* the world's own (the zone's shaders, or fogged) in its scene, blended ones too -
                       * its decals: the sun's shadow falls on it */
     uint8_t fill;   /* D3DFILLMODE */

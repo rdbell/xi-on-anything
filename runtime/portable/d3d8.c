@@ -1061,11 +1061,13 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
 }
 
 static void ui_present(void);
+static uint32_t g_ws_frame = 1; /* frames presented (world_smooth) */
 
 static void IDirect3DDevice8_Present(Guest* g)
 {
     cap_present();
     scene_present();
+    g_ws_frame++;
     ui_present();
     if (g_present_hook)
         g_present_hook();
@@ -2944,7 +2946,15 @@ static void scene_note(GfxDraw* d)
      * world is done, only runs where it is used */
     int mrt_on = gfx_fx_get("rt_mrt") != 0.0f;
     if (mrt_on && c == g_scene.world && !face && !level && large && !g_scene.final_done)
+    {
         d->mrt = d->vs.rhw || (d->pipe.blend && !d->depth.zwrite) ? 2 : 1;
+        /* the zone's own blended decals (sand, grass, paths over the ground: fogged, depth-tested, blended over
+         * what is there, no depth written) go into the image and are lit with the ground under them - in the
+         * layer put over it once lit they had no shadow nor sun on them. (Not glows and spells: added, unfogged.) */
+        if (d->mrt == 2 && !d->vs.rhw && d->depth.zenable && (d->fs.fog || d->vs.fog_vertex || d->vs.prog) &&
+            d->pipe.src == 5 && d->pipe.dst == 6 && gfx_fx_get("rt_decal") != 0.0f)
+            d->mrt = 3;
+    }
     /* the interface onto the world before it is lit: kept out of the lighting (the back end marks it) */
     if (!mrt_on && d->vs.rhw && c == g_scene.rt && !g_scene.final_done)
         d->overlay = 1;
@@ -3153,6 +3163,113 @@ static void scene_present(void)
     g_scene.cam_draw = g_scene.sun_draw = g_scene.cam_rank = 0;
 }
 
+/* FFXI moves a far object's animation only every few frames - palm fronds swayed in steps, their shadows
+ * jumping with them. Each fixed-function object's world matrix, found again the next frame by its mesh and
+ * where it stands, goes from the one shown before to the newest over the frames between the game's updates:
+ * smooth at the frame rate, one update behind (anim_smooth in fx.txt; 0 off). Not what is drawn with no
+ * world matrix of its own (characters, skinned into the world). */
+enum { WS_N = 4096, WS_PROBE = 8, WS_GAP = 8 };
+typedef struct
+{
+    uint64_t key;
+    float from[16], to[16], shown[16];
+    uint32_t t_to, gap, seen;
+} WsEnt;
+static WsEnt g_ws[WS_N];
+
+static void world_smooth(GfxDraw* d, uint32_t start, uint32_t indices, uint32_t n)
+{
+    State* s = &g_dev.cur;
+    const float* W = s->xf[24];
+    static uint32_t on_frame;
+    static int on;
+    if (on_frame != g_ws_frame)
+        on_frame = g_ws_frame, on = gfx_fx_get("anim_smooth") != 0.0f;
+    static uint32_t why[8], log_frame;
+    if (g_ws_frame - log_frame >= 120)
+    {
+        struct stat st;
+        FILE* f = stat("/tmp/ffxi_wslog", &st) ? NULL : fopen("/tmp/ffxi_ws.txt", "a");
+        if (f)
+            fprintf(f, "frame %u off %u vs %u rhw %u blend %u ident %u same %u noroom %u smoothed %u\n", g_ws_frame, why[0], why[1],
+                why[2], why[3], why[4], why[5], why[6], why[7]), fclose(f);
+        memset(why, 0, sizeof why), log_frame = g_ws_frame;
+    }
+    if (!on || d->vs.prog || d->vs.rhw || s->rs[151])
+    {
+        why[!on ? 0 : d->vs.prog ? 1 : d->vs.rhw ? 2 : 3]++;
+        return;
+    }
+    static const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    if (!memcmp(W, I, 64))
+    {
+        why[4]++;
+        return;
+    }
+    uint64_t h = 1469598103934665603ull;
+    uint32_t parts[7] = { s->stream[0], s->ib, start, indices, n, (uint32_t)(int32_t)floorf(W[12] * 0.25f),
+        (uint32_t)(int32_t)floorf(W[14] * 0.25f) };
+    for (int i = 0; i < 7; ++i)
+        h = (h ^ parts[i]) * 1099511628211ull;
+    h |= 1;
+    WsEnt* e = NULL;
+    WsEnt* spare = NULL;
+    for (int i = 0; i < WS_PROBE; ++i)
+    {
+        WsEnt* c = &g_ws[(h + (uint64_t)i) % WS_N];
+        if (c->key == h)
+        {
+            e = c;
+            break;
+        }
+        if (!spare && (!c->key || g_ws_frame - c->seen > 120))
+            spare = c;
+    }
+    if (e && e->seen == g_ws_frame) /* two of it in one place this frame: which is which unknown */
+    {
+        why[5]++;
+        return;
+    }
+    int fresh = !e || g_ws_frame - e->seen > 1;
+    if (!e)
+    {
+        if (!spare)
+        {
+            why[6]++;
+            return;
+        }
+        e = spare, e->key = h;
+    }
+    if (fresh)
+    {
+        memcpy(e->from, W, 64), memcpy(e->to, W, 64), memcpy(e->shown, W, 64);
+        e->t_to = g_ws_frame, e->gap = 1, e->seen = g_ws_frame;
+        return;
+    }
+    e->seen = g_ws_frame;
+    if (memcmp(W, e->to, 64))
+    {
+        float jump = 0.0f;
+        for (int i = 0; i < 16; ++i)
+            jump = fmaxf(jump, fabsf(W[i] - e->to[i]) * (i >= 12 ? 0.25f : 1.0f));
+        uint32_t gap = g_ws_frame - e->t_to;
+        memcpy(e->from, jump > 0.5f ? W : e->shown, 64); /* a jump (a new pose, moved away): at once */
+        memcpy(e->to, W, 64);
+        e->gap = gap < 1 ? 1 : gap > WS_GAP ? WS_GAP : gap, e->t_to = g_ws_frame;
+    }
+    why[7]++;
+    float f = (float)(g_ws_frame - e->t_to + 1) / (float)e->gap;
+    f = f > 1.0f ? 1.0f : f;
+    float Ws[16], wv[16];
+    for (int i = 0; i < 16; ++i)
+        Ws[i] = e->from[i] + (e->to[i] - e->from[i]) * f;
+    memcpy(e->shown, Ws, 64);
+    mat_mul(wv, Ws, s->xf[2]);
+    mat_mul(d->u.wvp, wv, s->xf[3]);
+    memcpy(d->u.wv, wv, 64);
+    normal_matrix(d->u.wvit, wv);
+}
+
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
     uint32_t up_data, uint32_t up_stride, uint32_t n);
 
@@ -3264,6 +3381,7 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     }
     if (!set_streams(d, first, nverts, up_data, up_stride))
         return;
+    world_smooth(d, start, indices, n);
     scene_note(d);
     if (g_cap)
         cap_draw(d, prim, count, first, nverts, up_data, up_stride);
