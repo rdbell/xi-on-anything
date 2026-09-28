@@ -2474,7 +2474,7 @@ static const struct
     { "rt_only_vs", offsetof(__typeof__(g_fxs), rt_only_vs), 0.0f },
     { "rt_gi", offsetof(__typeof__(g_fxs), rt_gi), 0.35f },
     { "rt_gi_radius", offsetof(__typeof__(g_fxs), rt_gi_radius), 8.0f },
-    { "rt_soft", offsetof(__typeof__(g_fxs), rt_soft), 0.3f },
+    { "rt_soft", offsetof(__typeof__(g_fxs), rt_soft), 0.0f },
     { "rt_point", offsetof(__typeof__(g_fxs), rt_point), 1.0f },
     { "rt_point_range", offsetof(__typeof__(g_fxs), rt_point_range), 2.0f },
     { "rt_glow", offsetof(__typeof__(g_fxs), rt_glow), 1.0f },
@@ -4237,12 +4237,16 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
     matd_mul(md, rel, km); /* the frame's clip space -> the map */
     for (int j = 0; j < 16; ++j)
         M[j] = (float)md[j];
-    int late = g_late_serial == g_serial;
+    /* and what was drawn after the effects (the characters): this frame's if any yet, else the last
+     * frame's - the lighting runs before this frame's are drawn; a fixed-function one through its own view */
+    int late = g_late_serial == g_serial || g_late_serial + 1 == g_serial;
     uint32_t total = g_ncasters + (late ? g_nlate : 0);
     for (uint32_t i = 0; i < total; ++i)
     {
         const Caster* cs = i < g_ncasters ? &g_casters[i] : &g_late[i - g_ncasters];
         if (g_fxs.rt_only_vs != 0.0f && cs->has_cw) /* the check: zone shaders alone */
+            continue;
+        if (i >= g_ncasters && g_late_serial != g_serial && !cs->has_cw) /* the last frame's, placed by its camera */
             continue;
         /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
         if (!cs->ztest)
@@ -4748,7 +4752,9 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         memcpy(u.s[c], k->m, 64);
         /* the filter's step: rt_soft world units across its four, at least a texel and a half; off the face along
          * its normal by two of those steps' texels, as much of depth (a wider filter reaches further round) */
-        double step = fmax(1.5, fmax(g_fxs.rt_soft, 0.0) / k->texel / 3.0);
+        /* a texel apart: sixteen filtered compares a texel apart make one smooth ramp (further apart they
+         * leave steps in it); rt_soft widens it, in world units across the four */
+        double step = fmax(1.0, fmax(g_fxs.rt_soft, 0.0) / k->texel / 3.0);
         u.cs[c][0] = (float)(1.3 * step * k->texel), u.cs[c][1] = (float)(step / RT_MAP);
         u.cs[c][2] = (float)(0.7 * step * k->texel / k->range), u.cs[c][3] = (float)k->reach;
     }
@@ -5615,7 +5621,7 @@ static int rt_frame(const float* clip_world, const float* view_world, const floa
     g_rtx.prev = g_serial;
     /* this frame's camera, for what the world draws after its effects (traced with the next scene) */
     memcpy(g_rtx.late_cw, clip_world, 64), memcpy(g_rtx.late_vw, view_world, 64);
-    late_clear(); /* encoded: the command buffer holds what it reads */
+    /* (the late list is kept: the sun's maps of the next frame draw these characters - late_new clears it) */
     free(jobs);
     /* a place kept that the camera looks at (its mesh's box well inside the view) and the game has
      * not drawn for three frames traced is not there any more: a nearer or farther detail of the mesh
