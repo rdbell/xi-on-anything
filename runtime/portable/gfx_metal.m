@@ -143,7 +143,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1564,12 +1564,41 @@ void gfx_draw(const GfxDraw* d)
             g_gl.serial = g_serial, g_gl.n = 0;
         double o[4];
         int clip = d->vs.prog != 0, ok = 1;
-        if (clip)
+        /* the middle of its vertices (a billboard's are in the world already, its transform all but none) */
+        float m[3] = { 0, 0, 0 };
+        {
+            const GfxElem* el = &d->vs.el[GFX_R_POSITION];
+            int st = el->stream, stride = d->u.stride[st], nv = 0;
+            const uint8_t* base = NULL;
+            if (el->used && el->type == GFX_FLOAT3 && stride > 0)
+            {
+                if (d->data[st])
+                    base = (const uint8_t*)d->data[st];
+                else if (d->buf[st] && d->buf[st]->b.storageMode == MTLStorageModeShared)
+                    base = (const uint8_t*)[d->buf[st]->b contents] + d->buf_off[st] +
+                        (int64_t)((int32_t)d->vertex_start + d->u.vofs) * stride;
+            }
+            if (base)
+                for (int i = 0; i < 8 && (uint32_t)i < d->count * 3; ++i, ++nv)
+                {
+                    const float* v = (const float*)(base + (size_t)i * stride + d->u.offset[GFX_R_POSITION]);
+                    m[0] += v[0], m[1] += v[1], m[2] += v[2];
+                }
+            if (!nv)
+                ok = 0;
+            else
+                m[0] /= nv, m[1] /= nv, m[2] /= nv;
+        }
+        if (!ok)
+            ;
+        else if (clip)
             for (int r = 0; r < 4; ++r)
-                o[r] = d->u.vsc[r][3];
+                o[r] = m[0] * d->u.vsc[r][0] + m[1] * d->u.vsc[r][1] + m[2] * d->u.vsc[r][2] + d->u.vsc[r][3];
         else
         {
-            double vp[16], inv[16], c[4] = { d->u.wvp[12], d->u.wvp[13], d->u.wvp[14], d->u.wvp[15] };
+            double vp[16], inv[16], c[4];
+            for (int j = 0; j < 4; ++j)
+                c[j] = m[0] * d->u.wvp[j] + m[1] * d->u.wvp[4 + j] + m[2] * d->u.wvp[8 + j] + d->u.wvp[12 + j];
             for (int j = 0; j < 16; ++j)
                 vp[j] = d->view_proj[j];
             ok = matd_inverse(inv, vp);
@@ -2435,6 +2464,9 @@ static const struct
     { "rt_point_range", offsetof(__typeof__(g_fxs), rt_point_range), 2.0f },
     { "rt_glow", offsetof(__typeof__(g_fxs), rt_glow), 1.0f },
     { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.4f },
+    { "rt_point_far", offsetof(__typeof__(g_fxs), rt_point_far), 60.0f },
+    { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 24.0f },
+    { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 0.35f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4400,8 +4432,8 @@ static const char DS_MSL[] =
     "  if (any(abs(q.xy) > 0.95)) return float3(0.0);\n"
     "  float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
     "  float3 sum = float3(0.0); float wsum = 0.0;\n"
-    "  for (int i = 0; i < 12; ++i) {\n"
-    "    float t = (float(i) + 0.5) / 12.0, a = float(i) * 2.39996;\n"
+    "  for (int i = 0; i < 8; ++i) {\n"
+    "    float t = (float(i) + 0.5) / 8.0, a = float(i) * 2.39996;\n"
     "    float2 o = float2(cos(a), sin(a)) * sqrt(t) * d.gi.y;\n"
     "    float2 us = uv + o;\n"
     "    float zs = sm.sample(ls, us, 1u);\n"
@@ -4413,7 +4445,7 @@ static const char DS_MSL[] =
     "    sum += rsm.sample(ls, us, level(d.gi.w)).rgb * w;\n"
     "    wsum += 1.0;\n"
     "  }\n"
-    "  return wsum > 0.0 ? sum / 12.0 : float3(0.0);\n"
+    "  return wsum > 0.0 ? sum / 8.0 : float3(0.0);\n"
     "}\n"
     /* the fog along the ray from the camera to p (dist away): 24 steps, each lit by the fog's colour and
      * by the sun where the maps say it reaches, thinning with height; T what of the surface gets through */
@@ -4783,6 +4815,49 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 u.lc[n][3] = 1.0f; /* (a glow's: the debug view marks it apart) */
                 n++;
             }
+        /* only what can light the view: within rt_point_far of the camera and not wholly behind it; the
+         * nearest rt_point_max; their colour toward white (rt_point_sat of its tint) */
+        {
+            float fwd[3] = { 0, 0, 0 };
+            {
+                float c[4] = { 0, 0, 0.5f, 1 }, w[4];
+                for (int j = 0; j < 4; ++j)
+                    w[j] = c[2] * g_sm.rel[8 + j] + c[3] * g_sm.rel[12 + j];
+                float l = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * (w[3] < 0 ? -1.0f : 1.0f);
+                if (fabsf(l) > 1e-6f)
+                    fwd[0] = w[0] / l, fwd[1] = w[1] / l, fwd[2] = w[2] / l;
+            }
+            float far = g_fxs.rt_point_far > 0.0f ? g_fxs.rt_point_far : 60.0f, key[RT_LIGHTS];
+            uint32_t m = 0;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                float* lp = u.lp[i];
+                float d2 = lp[0] * lp[0] + lp[1] * lp[1] + lp[2] * lp[2];
+                float ahead = lp[0] * fwd[0] + lp[1] * fwd[1] + lp[2] * fwd[2];
+                if (sqrtf(d2) - lp[3] > far || ahead < -lp[3])
+                    continue;
+                memcpy(u.lp[m], u.lp[i], 16), memcpy(u.lc[m], u.lc[i], 16), key[m] = d2;
+                m++;
+            }
+            for (uint32_t i = 1; i < m; ++i) /* nearest first */
+                for (uint32_t j = i; j > 0 && key[j] < key[j - 1]; --j)
+                {
+                    float t[4], k = key[j];
+                    key[j] = key[j - 1], key[j - 1] = k;
+                    memcpy(t, u.lp[j], 16), memcpy(u.lp[j], u.lp[j - 1], 16), memcpy(u.lp[j - 1], t, 16);
+                    memcpy(t, u.lc[j], 16), memcpy(u.lc[j], u.lc[j - 1], 16), memcpy(u.lc[j - 1], t, 16);
+                }
+            uint32_t cap = g_fxs.rt_point_max >= 1.0f ? (uint32_t)g_fxs.rt_point_max : 24;
+            n = m < cap ? m : cap;
+            float sat = fminf(fmaxf(g_fxs.rt_point_sat, 0.0f), 1.0f);
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                float* c = u.lc[i];
+                float y = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+                for (int j = 0; j < 3; ++j)
+                    c[j] = y + (c[j] - y) * sat;
+            }
+        }
         u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point;
         g_pl_shown = n;
     }

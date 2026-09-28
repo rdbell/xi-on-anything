@@ -2914,13 +2914,14 @@ static void scene_note(GfxDraw* d)
     int large = (uint64_t)rt->width * rt->height * 2 >= (uint64_t)g_dev.pp[0] * g_dev.pp[1];
     if (g_scene.final_done && c == g_scene.rt && !d->vs.rhw && d->depth.zenable)
         g_scene.after_final++;
-    /* the world sampled for the screen: complete, whatever came after its effects */
-    if (g_scene.world_done && !g_scene.final_done && large)
+    /* the world sampled for the screen - complete, whatever came after its effects - or the interface
+     * (nameplates, text) drawn onto it: the back end's lighting of the world goes under that */
+    if (g_scene.world_done && !g_scene.final_done)
     {
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
-        if (sampled)
+        if ((sampled && large) || (d->vs.rhw && c == g_scene.rt))
             g_scene.final_done = 1, gfx_world_final();
     }
     if (g_scene.draws && !g_scene.done)
