@@ -2629,7 +2629,7 @@ static const struct
     { "rt_point", offsetof(__typeof__(g_fxs), rt_point), 1.0f },
     { "rt_point_range", offsetof(__typeof__(g_fxs), rt_point_range), 2.0f },
     { "rt_glow", offsetof(__typeof__(g_fxs), rt_glow), 1.0f },
-    { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.4f },
+    { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.25f },
     { "rt_point_far", offsetof(__typeof__(g_fxs), rt_point_far), 60.0f },
     { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 48.0f },
     { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 1.0f },
@@ -4846,15 +4846,19 @@ static const char DS_MSL[] =
      * the range up to the white level rolled off into what is left below white */
     "struct DSOut { float4 c [[color(0)]]; float b [[color(1)]]; };\n"
     "static float ds_luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
-    "static float3 ds_tone(constant DS& d, float3 x) {\n"
-    "  x = max(x * d.tm.x, 0.0);\n"
-    "  x = 0.5 * pow(x / 0.5, float3(d.tm.y));\n"
-    "  x = max(x - d.tm.z, 0.0) / max(1.0 - d.tm.z, 1e-3);\n"
+    /* (on the brightness alone, the colour kept as the game painted it: a curve a channel tints) */
+    "static float3 ds_tone(constant DS& d, float3 c) {\n"
+    "  c = max(c * d.tm.x, 0.0);\n"
+    "  float x = ds_luma(c);\n"
+    "  if (x <= 1e-5) return float3(0.0);\n"
+    "  float y = 0.5 * pow(x / 0.5, d.tm.y);\n"
+    "  y = max(y - d.tm.z, 0.0) / max(1.0 - d.tm.z, 1e-3);\n"
     "  float k = d.sg.y, w = max(d.tm.w, k + 0.05);\n"
     "  float cc = (1.0 - k) * (w - k) / max(w - 1.0, 1e-3);\n"
-    "  float3 t = max(x - k, 0.0);\n"
-    "  float3 y = select(x, k + t / (1.0 + t / cc), x > k);\n"
-    "  return saturate(y);\n"
+    "  if (y > k) { float t = y - k; y = k + t / (1.0 + t / cc); }\n"
+    "  float3 o = c * (y / x);\n"
+    "  float m = max3(o.r, o.g, o.b);\n"
+    "  return m > 1.0 ? mix(o / m, float3(1.0), saturate((m - 1.0) * 0.5)) : o;\n" /* (past white: toward white) */
     "}\n"
     /* the lit image with the see-through layer over it (the world's layers, rt_mrt: pl.w) */
     "fragment DSOut ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
