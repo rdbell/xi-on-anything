@@ -143,7 +143,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1261,6 +1261,7 @@ typedef struct Caster
     int32_t zbias;
     float cw[16]; /* a fixed-function draw's clip space back to the world, its own view and projection's */
     uint8_t ztest; /* drawn with a real depth test (not the sky's: off, or always passing) */
+    const void* target; /* what it was drawn into (a late one: the world's target, or another) */
 } Caster;
 
 /* the zone's point lights, as its shaders were given them: each draw's c11 (the light in the object's
@@ -1330,6 +1331,7 @@ static Caster* late_new(const GfxDraw* d)
     c->vs = d->vs_tokens, c->ps = d->ps_tokens;
     c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
     c->ztest = d->depth.zenable && d->depth.zfunc != 8;
+    c->target = g_rt;
     return c;
 }
 
@@ -2485,6 +2487,7 @@ static const struct
     { "rt_sun_min", offsetof(__typeof__(g_fxs), rt_sun_min), 20.0f },
     { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
+    { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 0.0f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4240,7 +4243,7 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         M[j] = (float)md[j];
     /* and what was drawn after the effects (the characters): this frame's if any yet, else the last
      * frame's - the lighting runs before this frame's are drawn; a fixed-function one through its own view */
-    int late = g_late_serial == g_serial || g_late_serial + 1 == g_serial;
+    int late = g_fxs.rt_late != 0.0f && (g_late_serial == g_serial || g_late_serial + 1 == g_serial);
     uint32_t total = g_ncasters + (late ? g_nlate : 0);
     for (uint32_t i = 0; i < total; ++i)
     {
@@ -4249,7 +4252,10 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             continue;
         if (i >= g_ncasters && layer == 0)
             g_sm.late_seen++;
-        if (i >= g_ncasters && g_late_serial != g_serial && !cs->has_cw) /* the last frame's, placed by its camera */
+        /* of what came after the effects, only the fixed-function draws (the characters): they carry their own
+         * view; the zone's shaders' there went into other targets through other cameras - placed by this
+         * one's, they covered the whole place */
+        if (i >= g_ncasters && (!cs->has_cw || cs->target != (const void*)g_vfog_target))
             continue;
         /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
         if (!cs->ztest)
@@ -4279,6 +4285,16 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
                 {
                     double ex = x - inv[8] / inv[11], ey = y - inv[9] / inv[11], ez = z - inv[10] / inv[11];
                     sky = ex * ex + ey * ey + ez * ez < 4.0;
+                }
+                if (inv && layer == 0 && !access("/tmp/ffxi_ffplog", F_OK) && fabs(inv[11]) > 1e-12)
+                {
+                    static FILE* lf;
+                    if (!lf)
+                        lf = fopen("/tmp/ffxi_ffp.txt", "w");
+                    if (lf)
+                        fprintf(lf, "%llu late %d eye %.1f %.1f %.1f origin %.1f %.1f %.1f cam %.1f %.1f %.1f n %u fog %d prog %08x ntex %d\n",
+                            (unsigned long long)g_serial, i >= g_ncasters, inv[8] / inv[11], inv[9] / inv[11], inv[10] / inv[11], x, y, z,
+                            cam[0], cam[1], cam[2], cs->n, cs->lib.fs.fog, cs->lib.fs.prog, cs->lib.vs.ntex);
                 }
                 if (inv)
                     x -= cam[0], y -= cam[1], z -= cam[2];
