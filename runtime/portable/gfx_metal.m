@@ -125,7 +125,7 @@ static GfxTex* g_rt;
 /* the world's layers (rt_mrt): its target, what see-through draws add (s) and what of the image shows through
  * them (t), put together with the lit image once the world is complete (rt_world_composite) */
 static const GfxTex* g_ov_target;
-static id<MTLTexture> g_ov_s, g_ov_t;
+static id<MTLTexture> g_ov_s, g_ov_t, g_ov_n; /* (n: the solid's normal, as a direction in its clip space) */
 static int g_ov_pass;          /* the pass being encoded has them */
 static int g_ov_reset = 1;     /* cleared when next attached (s 0, t 1) */
 static uint64_t g_ov_serial;   /* the frame a draw last went into them */
@@ -151,7 +151,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -871,18 +871,21 @@ static int begin_pass(void)
         NSUInteger w = g_rt->tex.width, h = g_rt->tex.height;
         if (!g_ov_s || g_ov_s.width != w || g_ov_s.height != h)
         {
-            [g_ov_s release], [g_ov_t release];
+            [g_ov_s release], [g_ov_t release], [g_ov_n release];
             MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w
                                                                                         height:h mipmapped:NO];
             td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             td.storageMode = MTLStorageModePrivate;
             g_ov_s = [g_dev newTextureWithDescriptor:td], g_ov_t = [g_dev newTextureWithDescriptor:td];
+            g_ov_n = [g_dev newTextureWithDescriptor:td];
             g_ov_reset = 1;
         }
         int clear = g_ov_reset || (g_pending_clear & 1);
-        p.colorAttachments[1].texture = g_ov_s, p.colorAttachments[2].texture = g_ov_t;
-        p.colorAttachments[1].storeAction = p.colorAttachments[2].storeAction = MTLStoreActionStore;
-        p.colorAttachments[1].loadAction = p.colorAttachments[2].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        p.colorAttachments[1].texture = g_ov_s, p.colorAttachments[2].texture = g_ov_t, p.colorAttachments[3].texture = g_ov_n;
+        p.colorAttachments[1].storeAction = p.colorAttachments[2].storeAction = p.colorAttachments[3].storeAction = MTLStoreActionStore;
+        p.colorAttachments[1].loadAction = p.colorAttachments[2].loadAction = p.colorAttachments[3].loadAction =
+            clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        p.colorAttachments[3].clearColor = MTLClearColorMake(0, 0, 0, 0);
         p.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
         p.colorAttachments[2].clearColor = MTLClearColorMake(1, 1, 1, 1);
         g_ov_reset = 0, g_ov_pass = 1;
@@ -1113,6 +1116,9 @@ static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_
             }
             if (m == 2 || m == 3)
                 c.writeMask = MTLColorWriteMaskNone;
+            MTLRenderPipelineColorAttachmentDescriptor* on = pd.colorAttachments[3];
+            on.pixelFormat = MTLPixelFormatRGBA16Float;
+            on.writeMask = m == 1 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
         }
         pd.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth;
         pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k->stencil;
@@ -2552,6 +2558,7 @@ static const struct
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
     { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 0.0f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
+    { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4627,7 +4634,8 @@ static const char DS_MSL[] =
     "  return ws > 1e-6 ? sum / ws : ft.read(uint2(clamp(b, int2(0), hi)));\n"
     "}\n"
     "static float4 ds_lit(DO in, constant DS& d, depth2d<float> dep, depth2d_array<float> sm, texture2d<float> src,\n"
-    "                     texture2d<float> rsm, texture2d<float> ft, texture2d<float> fd, texture2d<uint> st) {\n"
+    "                     texture2d<float> rsm, texture2d<float> ft, texture2d<float> fd, texture2d<uint> st,\n"
+    "                     texture2d<float> nt) {\n"
     "  int2 px = int2(in.pos.xy);\n"
     "  float4 col = src.read(uint2(px));\n"
     /* the interface drawn onto the world before it was lit: left as it is */
@@ -4660,6 +4668,20 @@ static const char DS_MSL[] =
     "  float nn = dot(n, n);\n"
     "  n = nn > 1e-20 ? n * rsqrt(nn) : float3(0.0, -1.0, 0.0);\n"
     "  if (dot(n, p) > 0.0) n = -n;\n"
+    /* the surface's own smooth normal where the draw gave one (its direction in clip space, back through the
+     * camera: the point a little along it, less the point, both through) - else the depth's slope, above */
+    "  float3 ns = n;\n"
+    "  {\n"
+    "    float4 cn = nt.read(uint2(clamp(px, int2(0), int2(nt.get_width() - 1, nt.get_height() - 1))));\n"
+    "    if (d.pl.w > 0.0 && dot(cn, cn) > 1e-8) {\n"
+    "      float2 ndc = (float2(px) + 0.5 - d.vp.xy) / d.vp.zw * 2.0 - 1.0;\n"
+    "      float zn = (z - d.pz.z) / max(d.pz.w - d.pz.z, 1e-6);\n"
+    "      float4 h0 = d.ivp * float4(ndc.x, -ndc.y, zn, 1.0), h1 = d.ivp * cn;\n"
+    "      float3 dn = h1.xyz * h0.w - h0.xyz * h1.w;\n"
+    "      if (dot(dn, dn) > 1e-20) { ns = normalize(dn); if (dot(ns, p) > 0.0) ns = -ns; }\n"
+    "    }\n"
+    "  }\n"
+    "  if (d.k.z > 12.5 && d.k.z < 13.5) return float4(ns * 0.5 + 0.5, 1.0);\n" /* rt_debug 13: the normal */
     "  float dist = length(p);\n"
     /* rt_debug 9: the place rebuilt (a 2-unit grid on x/z, height in blue); 10: the far map's depth there
      * against the place's own (red: the map nearer the sun) */
@@ -4682,6 +4704,8 @@ static const char DS_MSL[] =
     "  }\n"
     "  if (v < 0.0 && d.k.z > 0.0 && d.k.z < 7.5) return float4(0.8, 0.1, 0.1, 1.0);\n"
     "  if (v < 0.0) v = 1.0;\n"
+    /* faces turned from the sun in shade too, smoothly across the turn (fwd.w of it: rt_face) */
+    "  v = min(v, mix(1.0, smoothstep(-0.05, 0.3, dot(ns, d.sun.xyz)), d.fwd.w));\n"
     "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
     /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
     "  float f = 1.0;\n"
@@ -4690,7 +4714,7 @@ static const char DS_MSL[] =
     "    float w = d.pz.y / (zn - d.pz.x);\n"
     "    f = saturate(clamp((d.fog.y - abs(w)) * d.fog.x, d.fog.z, d.fog.w));\n"
     "  }\n"
-    "  float3 gi = d.gi.x > 0.0 ? ds_gi(d, sm, rsm, p, n) * d.gi.x : float3(0.0);\n"
+    "  float3 gi = d.gi.x > 0.0 ? ds_gi(d, sm, rsm, p, ns) * d.gi.x : float3(0.0);\n"
     "  if (d.k.z > 4.5 && d.k.z < 5.5) return float4(gi * 3.0, 1.0);\n"
     /* rt_debug 8: the left half without the bounce light, the right with it */
     "  if (d.k.z > 7.5 && d.k.z < 8.5 && in.pos.x < d.vp.x + d.vp.z * 0.5) gi = float3(0.0);\n"
@@ -4708,7 +4732,7 @@ static const char DS_MSL[] =
     "    if (dl >= r) continue;\n"
     "    float fall = 1.0 - dl / r; fall *= fall;\n"
     /* wrapped round the surface: the facets of the depth's own normal hardly show */
-    "    float ndl = saturate(dot(n, L / max(dl, 1e-3)) * 0.35 + 0.65);\n"
+    "    float ndl = saturate(dot(ns, L / max(dl, 1e-3)) * 0.6 + 0.4);\n"
     "    oc += col.rgb * d.lc[i].rgb * (d.pl.y * fall * ndl) * f;\n"
     "    plsum += d.lc[i].rgb * (d.pl.y * fall * ndl);\n"
     "  }\n"
@@ -4730,8 +4754,9 @@ static const char DS_MSL[] =
     "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
     "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
     "                      texture2d<float> fd [[texture(5)]], texture2d<uint> st [[texture(6)]],\n"
-    "                      texture2d<float> ls [[texture(7)]], texture2d<float> lt [[texture(8)]]) {\n"
-    "  float4 c = ds_lit(in, d, dep, sm, src, rsm, ft, fd, st);\n"
+    "                      texture2d<float> ls [[texture(7)]], texture2d<float> lt [[texture(8)]],\n"
+    "                      texture2d<float> nt [[texture(9)]]) {\n"
+    "  float4 c = ds_lit(in, d, dep, sm, src, rsm, ft, fd, st, nt);\n"
     "  if (d.pl.w > 0.0) { uint2 p = uint2(in.pos.xy); c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; }\n"
     "  return c;\n"
     "}\n"
@@ -4862,6 +4887,7 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
     }
     memcpy(u.sun, g_rtx.sun_now, 16);
     u.k[0] = g_rtx.k_now[0], u.k[1] = g_rtx.k_now[2], u.k[2] = g_fxs.rt_debug;
+    u.fwd[3] = fminf(fmaxf(g_fxs.rt_face, 0.0f), 1.0f);
     if (g_zfog_serial == g_serial && g_zfog[0] != 0.0f)
         memcpy(u.fog, g_zfog, 16);
     memcpy(u.fogc, s->fogcolor, 16);
@@ -5149,6 +5175,7 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
     [e setFragmentTexture:sview ? sview : g_sm.ccopy atIndex:6];
     [e setFragmentTexture:layers ? g_ov_s : g_sm.ccopy atIndex:7];
     [e setFragmentTexture:layers ? g_ov_t : g_sm.ccopy atIndex:8];
+    [e setFragmentTexture:layers && g_ov_n ? g_ov_n : g_sm.fogt atIndex:9];
     [e setFragmentTexture:g_sm.rsm atIndex:3];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];

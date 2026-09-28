@@ -22,7 +22,10 @@
 /* traced with the vertex's own normal (gfx_msl_generate): the world's normal passed on (VOut.wn), from
  * the object's space through the position transform - u.wvp, or a vs.1.x shader's constants from
  * g_rt_pos (-1: fixed function) - and the draw's camera back to the world */
-static int g_rt_wn, g_rt_pos;
+static _Thread_local int g_rt_wn, g_rt_pos; /* (per thread: pipelines are generated on several at once) */
+/* a solid draw onto the world's layers with a normal (fk->mrt 1): its normal's direction in clip space passed
+ * on (VOut.cn) and written for the lighting, which takes it back to the world with the frame's camera */
+static _Thread_local int g_mrt_n;
 
 _Static_assert(sizeof(GfxU) == 3536, "GfxU must match the MSL struct U");
 
@@ -94,6 +97,8 @@ static void emit_vout(Sb* b, const GfxVsKey* k)
         sb_printf(b, "  float4 t%d [[user(t%d)]];\n", i, i);
     if (k->rt)
         sb_printf(b, "  float3 wp [[user(wp)]];\n%s", g_rt_wn ? "  float3 wn [[user(wn)]];\n" : "");
+    if (g_mrt_n)
+        sb_printf(b, "  float4 cn [[user(cn)]];\n");
     sb_printf(b, "  float fog [[user(fog)]];\n  float ez [[user(ez)]];\n  float psize [[point_size]];\n};\n");
 }
 
@@ -192,6 +197,16 @@ void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
                          "    c1 = float4(dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]), dot(q1, u.vsc[%d]));\n",
                 g_rt_pos, g_rt_pos + 1, g_rt_pos + 2, g_rt_pos + 3, g_rt_pos, g_rt_pos + 1, g_rt_pos + 2, g_rt_pos + 3);
         sb_printf(b, "    float4 a = rd.m * c0, e = rd.m * c1;\n    o.wn = e.xyz / e.w - a.xyz / a.w;\n  }\n");
+    }
+    if (g_mrt_n && !k->shadow && !k->capture)
+    {
+        sb_printf(b, "  {\n    float4 nd = float4(normalize(v3.xyz + float3(1e-6, 0.0, 0.0)), 0.0);\n");
+        if (g_rt_pos < 0)
+            sb_printf(b, "    o.cn = u.wvp * nd;\n");
+        else
+            sb_printf(b, "    o.cn = float4(dot(nd, u.vsc[%d]), dot(nd, u.vsc[%d]), dot(nd, u.vsc[%d]), dot(nd, u.vsc[%d]));\n",
+                g_rt_pos, g_rt_pos + 1, g_rt_pos + 2, g_rt_pos + 3);
+        sb_printf(b, "  }\n");
     }
     sb_printf(b, "  return o;\n}\n");
 }
@@ -444,7 +459,7 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 {
     int pix = pixel_lit(vk);
     if (k->mrt)
-        sb_printf(b, "struct FsOut { float4 c [[color(0)]]; float4 s [[color(1)]]; float4 t [[color(2)]]; };\n");
+        sb_printf(b, "struct FsOut { float4 c [[color(0)]]; float4 s [[color(1)]]; float4 t [[color(2)]]; float4 n [[color(3)]]; };\n");
     sb_printf(b, "fragment %s fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", k->mrt ? "FsOut" : "float4", pix ? "vin" : "in");
     if (k->rt)
         sb_printf(b, ", constant RtDraw& rd [[buffer(5)]], depth2d_array<float> rt_sm [[texture(8)]]");
@@ -543,13 +558,14 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
         sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : rt_c == 2.0 ? float3(1.0, 1.0, 0.7) : rt_c == 3.0 ? float3(1.0, 0.75, 0.75) : float3(0.6, 0.5, 0.8));\n", col);
     /* the world's layers: the image, what the see-through adds (s) and what of the image shows through (t) */
     if (k->mrt == 1)
-        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); return o;\n}\n", col);
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); o.n = %s; return o;\n}\n", col,
+            g_mrt_n ? "normalize(in.cn + float4(1e-9))" : "float4(0.0)");
     else if (k->mrt == 2)
-        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = %s; return o;\n}\n", col, col, col);
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = %s; o.n = float4(0.0); return o;\n}\n", col, col, col);
     else if (k->mrt == 3)
-        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = float4(0.0); return o;\n}\n", col, col);
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = float4(0.0); o.n = float4(0.0); return o;\n}\n", col, col);
     else if (k->mrt == 4)
-        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); return o;\n}\n", col);
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); o.n = float4(0.0); return o;\n}\n", col);
     else
         sb_printf(b, "  return %s;\n}\n", col);
 }
@@ -608,6 +624,7 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
     sb_printf(&b, "%s", PRELUDE);
     g_rt_pos = vk->prog ? gfx_msl_vs1_pos_consts(vs_tokens) : -1;
     g_rt_wn = vk->rt && fk->rt && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
+    g_mrt_n = fk->mrt == 1 && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
     /* traced: what the back end gives each draw (buffer 5, RtDraw in gfx_metal.m): clip space to the
      * world less the camera's place, the camera's place, toward the sun (w: 1 when there is one), the
      * shadow's strength and how far out it reaches (k.x, k.z; k.y: the debug view), and the sun's shadow
