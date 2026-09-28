@@ -2841,6 +2841,9 @@ static struct
     GfxTex* world;
     int world_done; /* the effects ran on it this frame: once a frame */
     int final_done; /* gfx_world_final this frame */
+    GfxScene last;  /* the last scene with a camera of its own, and its target */
+    GfxTex* last_rt;
+    int have_last;
     uint32_t after_final, st_after_final, st_after_frames, st_after_max, st_final_present; /* the check */
     char after_note[160];
     uint32_t world_after; /* the world's own draws after the lighting this frame */
@@ -2895,6 +2898,19 @@ static void scene_finish(const char* why)
         g_scene.st_why[!strcmp(why, "sampled") || why[0] == 'e' ? 0 : why[0] == 'i' ? 1 : why[0] == 'p' ? 2 : 3]++;
         g_scene.st_cam[g_scene.cam ? g_scene.cam_rank : 0]++;
     }
+    /* no camera of its own this frame (no fogged fixed-function draw in view - in first person, some
+     * places): the last one's, rather than no effects and no lighting at all for as long */
+    if (g_scene.draws && !g_scene.done && !g_scene.cam && g_scene.have_last && g_scene.last_rt == g_scene.rt)
+    {
+        memcpy(g_scene.s.view, g_scene.last.view, sizeof g_scene.s.view);
+        memcpy(g_scene.s.proj, g_scene.last.proj, sizeof g_scene.s.proj);
+        memcpy(g_scene.s.vp, g_scene.last.vp, sizeof g_scene.s.vp);
+        memcpy(g_scene.s.fogcolor, g_scene.last.fogcolor, sizeof g_scene.s.fogcolor);
+        memcpy(g_scene.s.fog, g_scene.last.fog, sizeof g_scene.s.fog);
+        g_scene.cam = 1, g_scene.cam_rank = 0;
+    }
+    else if (g_scene.cam)
+        g_scene.last = g_scene.s, g_scene.have_last = 1, g_scene.last_rt = g_scene.rt;
     if (g_scene.draws && !g_scene.done && g_scene.cam && (!g_scene.world || g_scene.rt == g_scene.world) &&
         !g_scene.world_done)
     {
@@ -2961,7 +2977,8 @@ static void scene_note(GfxDraw* d)
          * nameplates and floating text there, blended, before it draws the scene onto the back buffer;
          * the effects go under them, not over. (Not the probe's own screen-space quads there, which
          * are opaque - and textured, some frames.) */
-        else if (d->vs.rhw && c == g_scene.rt && (g_dev.rt == g_dev.backbuffer || d->pipe.blend))
+        else if (d->vs.rhw && c == g_scene.rt && (g_dev.rt == g_dev.backbuffer || d->pipe.blend) &&
+            gfx_fx_get("iface_end") != 0.0f)
             scene_finish("interface");
         /* the effects over the world - flames, glows, spells: blended, writing no depth, and unfogged
          * (the zone's own blended decals among its draws are fogged). The effects go under them: fog

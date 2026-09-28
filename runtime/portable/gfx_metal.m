@@ -143,7 +143,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -2484,6 +2484,7 @@ static const struct
     { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 0.35f },
     { "rt_sun_min", offsetof(__typeof__(g_fxs), rt_sun_min), 20.0f },
     { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
+    { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4080,7 +4081,7 @@ static struct
     uint32_t chk[2][2];    /* the check: vs / fixed-function casters' origins off / on the far map */
     char chk_note[160];
     char vx_note[512];
-    uint32_t skipped_sky;
+    uint32_t skipped_sky, late_seen, late_drawn, late_cw;
     SmCascade c[RT_CASCADES];
     int nc;                /* the cascades of the last maps */
     double cam[3]; /* the camera the maps' matrices are relative to (their scene's) */
@@ -4246,6 +4247,8 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         const Caster* cs = i < g_ncasters ? &g_casters[i] : &g_late[i - g_ncasters];
         if (g_fxs.rt_only_vs != 0.0f && cs->has_cw) /* the check: zone shaders alone */
             continue;
+        if (i >= g_ncasters && layer == 0)
+            g_sm.late_seen++;
         if (i >= g_ncasters && g_late_serial != g_serial && !cs->has_cw) /* the last frame's, placed by its camera */
             continue;
         /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
@@ -4268,11 +4271,14 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
                 /* fixed function: its own view's eye (the sky's view leaves the camera's place out: its eye
                  * is the world's origin - not an object's place: characters are drawn from vertices in the
                  * world, their own transform none) */
+                /* (the sky's dome: centred on its view's eye. Characters too are drawn through a view that
+                 * leaves the camera's place out, but stand away from the eye; only the player's own, seen
+                 * from inside in first person, is left out with it) */
                 int sky = 0;
                 if (inv && fabs(inv[11]) > 1e-12)
                 {
-                    double ex = inv[8] / inv[11], ey = inv[9] / inv[11], ez = inv[10] / inv[11];
-                    sky = ex * ex + ey * ey + ez * ez < 1.0;
+                    double ex = x - inv[8] / inv[11], ey = y - inv[9] / inv[11], ez = z - inv[10] / inv[11];
+                    sky = ex * ex + ey * ey + ez * ez < 4.0;
                 }
                 if (inv)
                     x -= cam[0], y -= cam[1], z -= cam[2];
@@ -4412,6 +4418,8 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         else
             [e drawPrimitives:cs->prim vertexStart:cs->vstart vertexCount:cs->n];
         g_sm.drawn++;
+        if (i >= g_ncasters && layer == 0)
+            g_sm.late_drawn++;
     }
     [e endEncoding];
 }
@@ -6475,12 +6483,12 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
                         "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
-                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; point lights %u (kept %u, new %u [game %u zone %u glow %u], moved at most %.2f; zone%s); terrain:%s\n", g_rtx.dr_exact,
+                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; late casters seen %u drawn %u; point lights %u (kept %u, new %u [game %u zone %u glow %u], moved at most %.2f; zone%s); terrain:%s\n", g_rtx.dr_exact,
                         g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
                         g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel, g_sm.chk[0][1], g_sm.chk[0][0] + g_sm.chk[0][1],
-                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_pl_shown, g_lt_srcs[0], g_lt_new, g_lt_newsrc[0], g_lt_newsrc[1], g_lt_newsrc[2], g_lt_move, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0,
-                    g_lt_new = 0, g_lt_move = 0, memset(g_lt_newsrc, 0, sizeof g_lt_newsrc), g_sm.skipped_sky = 0,
+                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_sm.late_seen, g_sm.late_drawn, g_pl_shown, g_lt_srcs[0], g_lt_new, g_lt_newsrc[0], g_lt_newsrc[1], g_lt_newsrc[2], g_lt_move, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0,
+                    g_lt_new = 0, g_lt_move = 0, memset(g_lt_newsrc, 0, sizeof g_lt_newsrc), g_sm.skipped_sky = g_sm.late_seen = g_sm.late_drawn = 0,
                     memset(g_sm.chk, 0, sizeof g_sm.chk), g_sm.chk_note[0] = 0, g_sm.vx_note[0] = 0,
                     g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
