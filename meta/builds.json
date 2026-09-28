@@ -49,7 +49,10 @@
         "present_site": "0x100035cb"
       },
       "hooks": {
-        "nameplate_scale": "0x100863d6"
+        "nameplate_scale": "0x100863d6",
+        "lod_pick": "0x1017cb9c",
+        "lod_pick2": "0x1017e01d",
+        "cull_test": "0x10181bb0"
       },
       "crt": {
         "strlen": "0x10317440",
