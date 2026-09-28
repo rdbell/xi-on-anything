@@ -2160,7 +2160,7 @@ static const char FX_MSL[] =
      * same every frame; the blur averages exactly one 4x4 block (fx_blur), so each pixel ends up with
      * all 16 - even, and with no grain left to crawl as the camera moves. One pattern at every pixel
      * instead copies each occluder at the pattern's offsets: streaks and halos around characters. */
-    "  const int NS = 20;\n"
+    "  const int NS = 12;\n"
     "  float sum = 0.0;\n"
     "  for (int i = 0; i < NS; ++i) {\n"
     "    float a = (float(i) + k) / float(NS);\n"
@@ -6033,7 +6033,7 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 minz = 0, maxz = 1;
             /* the occlusion at about 2000 pixels across (half a 4096 background, all of 1920): fine
              * enough that its edges hold still; bloom and rays, soft anyway, at about 1000 */
-            uint32_t div = vw > 2048 ? 2 : 1, bdiv = vw > 2048 ? 4 : vw > 1024 ? 2 : 1;
+            uint32_t div = vw > 2048 ? 3 : vw > 1024 ? 2 : 1, bdiv = vw > 2048 ? 4 : vw > 1024 ? 2 : 1;
             NSUInteger aw = (NSUInteger)((vw + div - 1) / div), ah = (NSUInteger)((vh + div - 1) / div);
             NSUInteger bw = (NSUInteger)((vw + bdiv - 1) / bdiv), bh = (NSUInteger)((vh + bdiv - 1) / bdiv);
             float hand = s->proj[11] < 0.0f ? -1.0f : 1.0f;
