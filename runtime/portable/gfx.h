@@ -129,7 +129,10 @@ typedef struct GfxFsKey
     uint8_t mrt;  /* the world's layers (the back end's, rt_mrt): 0 none; 1 solid (the image, and the see-through
                    * layer reset where it lands); 2 see-through blended, 3 see-through replacing (the layer
                    * only); 4 plain, in a pass that has the layer (the image alone) */
+    uint8_t hdr_in; /* the world's layers kept past white (hdr_in): the stages and pixel shader not clamped at 1,
+                     * the colour stored at half (GFX_HDR_PRE) - the lighting pass doubles it back */
 } GfxFsKey;
+#define GFX_HDR_PRE "0.5"
 
 /* The render pipeline beyond the functions: blending and the color write mask. */
 typedef struct GfxPipeKey

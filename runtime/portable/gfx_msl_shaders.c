@@ -102,6 +102,8 @@ static int dst_name(char* out, size_t n, uint32_t t, int ps)
 }
 
 /* dst.mask = (value) with the result modifiers */
+extern _Thread_local int g_msl_hdr_in; /* gfx_msl.c */
+
 static void write_dst(Sb* b, uint32_t d, const char* value, int ps)
 {
     char name[32];
@@ -121,7 +123,7 @@ static void write_dst(Sb* b, uint32_t d, const char* value, int ps)
     else if (ps) /* ps.1.x registers hold [-1, 1] (at least; D3D8 hardware: MaxPixelShaderValue 1) */
     {
         char w[1100];
-        snprintf(w, sizeof w, "clamp(%s, -1.0, 1.0)", v);
+        snprintf(w, sizeof w, g_msl_hdr_in ? "clamp(%s, -1.0, 4.0)" : "clamp(%s, -1.0, 1.0)", v);
         snprintf(v, sizeof v, "%s", w);
     }
     if (mask == 0xF || mask == 0)

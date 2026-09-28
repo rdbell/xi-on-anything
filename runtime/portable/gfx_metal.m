@@ -156,7 +156,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_decal, anim_smooth, rt_sun_step, rt_cascade_cam, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_decal, anim_smooth, rt_sun_step, rt_cascade_cam, hdr_in, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1283,7 +1283,15 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
         k.lib.vs.rt = k.lib.fs.rt = 1;
     /* the interface onto the world before its lighting: marking the stencil (rt_defer) */
     if (g_ov_pass)
+    {
         k.lib.fs.mrt = d->mrt == 1 ? 1 : d->mrt == 2 ? (d->pipe.blend ? 2 : 3) : 4; /* (3: a decal, into the image) */
+        /* past white kept (hdr_in), stored at half: where the blend stays true at half - blended over by its alpha,
+         * added, or replacing (a colour times the image's own - modulated - is already at the image's scale) */
+        uint32_t sf = d->pipe.src, df = d->pipe.dst;
+        int lin = !d->pipe.blend || ((sf == 2 || sf == 5 || sf == 1) && (df == 1 || df == 2 || df == 6 || df == 5));
+        if (g_fxs.hdr_in != 0.0f && lin)
+            k.lib.fs.hdr_in = 1;
+    }
     int ov = !g_ov_pass && d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment();
     if (ov)
         k.lib.fs.overlay = 1;
@@ -2652,6 +2660,7 @@ static const struct
     { "anim_smooth", offsetof(__typeof__(g_fxs), anim_smooth), 1.0f },
     { "rt_sun_step", offsetof(__typeof__(g_fxs), rt_sun_step), 0.0f },
     { "rt_cascade_cam", offsetof(__typeof__(g_fxs), rt_cascade_cam), 1.0f },
+    { "hdr_in", offsetof(__typeof__(g_fxs), hdr_in), 1.0f },
     { "rt_point_day", offsetof(__typeof__(g_fxs), rt_point_day), 0.15f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
@@ -4718,7 +4727,7 @@ static const char DS_MSL[] =
     "using namespace metal;\n"
     "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
     "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; float4 fwd; float4 pl;\n"
-    "            float4 lp[128]; float4 lc[128]; float4 tm; float4 sg; };\n"
+    "            float4 lp[128]; float4 lc[128]; float4 tm; float4 sg; float4 tm2; };\n"
     "struct DO { float4 pos [[position]]; };\n"
     "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
     "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
@@ -4835,6 +4844,8 @@ static const char DS_MSL[] =
     "                     texture2d<float> nt) {\n"
     "  int2 px = int2(in.pos.xy);\n"
     "  float4 col = src.read(uint2(px));\n"
+    /* the world's layers stored at half (hdr_in: past white kept): back to its scale */
+    "  if (d.pl.w > 0.0) col.rgb *= d.tm2.x;\n"
     /* the interface drawn onto the world before it was lit: left as it is */
     "  if (d.pl.z > 0.0 && (st.read(uint2(px)).r & 0x80u) != 0u) return col;\n"
     /* rt_debug 6: the bounce light's map itself */
@@ -4986,15 +4997,15 @@ static const char DS_MSL[] =
     "  }\n"
     "  if (d.pl.w > 0.0) {\n"
     "    uint2 p = uint2(in.pos.xy); float3 t = lt.read(p).rgb;\n"
-    "    c.rgb = c.rgb * t + ls.read(p).rgb; b = 1.0 + (b - 1.0) * ds_luma(t);\n"
+    "    c.rgb = c.rgb * t + ls.read(p).rgb * d.tm2.x; b = 1.0 + (b - 1.0) * ds_luma(t);\n"
     "  }\n"
     "  DSOut o; o.c = c; o.b = b; return o;\n"
     "}\n"
     /* the layers alone, over the image as it is (no lighting this frame) */
-    "fragment DSOut ds_comp(DO in [[stage_in]], texture2d<float> src [[texture(2)]], texture2d<float> ls [[texture(7)]],\n"
+    "fragment DSOut ds_comp(DO in [[stage_in]], constant float4& hs [[buffer(0)]], texture2d<float> src [[texture(2)]], texture2d<float> ls [[texture(7)]],\n"
     "                        texture2d<float> lt [[texture(8)]]) {\n"
     "  uint2 p = uint2(in.pos.xy); float4 c = src.read(p);\n"
-    "  c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; DSOut o; o.c = c; o.b = 1.0; return o;\n"
+    "  c.rgb = (c.rgb * lt.read(p).rgb + ls.read(p).rgb) * hs.x; DSOut o; o.c = c; o.b = 1.0; return o;\n"
     "}\n";
 
 /* the game's point lights this frame and the last (the pass lights with the last complete frame's) */
@@ -5072,6 +5083,7 @@ typedef struct DsU
     float lc[RT_LIGHTS][4]; /* its colour */
     float tm[4];    /* the tone: exposure, contrast, black level, white (the input level shown as white) */
     float sg[4];    /* the sun's own light on what it reaches (a share of the colour), the tone's knee, on */
+    float tm2[4];   /* what the world's layers are scaled back by (hdr_in: stored at half) */
 } DsU;
 
 /* the pass into ct (its depth dep), for scene s */
@@ -5375,6 +5387,7 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
         sview = [dep newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
     u.pl[2] = sview ? 1.0f : 0.0f;
     u.pl[3] = layers ? 1.0f : 0.0f;
+    u.tm2[0] = layers && g_fxs.hdr_in != 0.0f ? 2.0f : 1.0f;
     /* (too large to pass inline: in this frame's ring) */
     id<MTLBuffer> ub;
     NSUInteger uoff;
@@ -5546,6 +5559,8 @@ static void rt_world_composite(void)
     [e setFragmentTexture:g_sm.ccopy atIndex:2];
     [e setFragmentTexture:g_ov_s atIndex:7];
     [e setFragmentTexture:g_ov_t atIndex:8];
+    float hs[4] = { g_fxs.hdr_in != 0.0f ? 2.0f : 1.0f, 0, 0, 0 };
+    [e setFragmentBytes:hs length:sizeof hs atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
     g_ov_reset = 1, g_ov_done = g_serial;

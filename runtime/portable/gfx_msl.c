@@ -26,6 +26,8 @@ static _Thread_local int g_rt_wn, g_rt_pos; /* (per thread: pipelines are genera
 /* a solid draw onto the world's layers with a normal (fk->mrt 1): its normal's direction in clip space passed
  * on (VOut.cn) and written for the lighting, which takes it back to the world with the frame's camera */
 static _Thread_local int g_mrt_n;
+/* the world kept past white (fk->hdr_in): what clamps at 1 clamps at 4 (the pixel shaders' too) */
+_Thread_local int g_msl_hdr_in;
 
 _Static_assert(sizeof(GfxU) == 3536, "GfxU must match the MSL struct U");
 
@@ -556,6 +558,8 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
      * red, none blue) */
     if (k->rt)
         sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : rt_c == 2.0 ? float3(1.0, 1.0, 0.7) : rt_c == 3.0 ? float3(1.0, 0.75, 0.75) : float3(0.6, 0.5, 0.8));\n", col);
+    if (k->hdr_in) /* stored at half: past white kept (the lighting pass doubles it back) */
+        sb_printf(b, "  %s.rgb *= " GFX_HDR_PRE ";\n", col);
     /* the world's layers: the image, what the see-through adds (s) and what of the image shows through (t) */
     if (k->mrt == 1)
         sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); o.n = %s; return o;\n}\n", col,
@@ -608,13 +612,15 @@ static void emit_ff_fs(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
             arg_expr(a2, sizeof a2, s->aa2);
             arg_expr(a0, sizeof a0, s->aa0);
             op_expr(ae, sizeof ae, s->aop, a1, a2, a0);
-            sb_printf(b, "  { float3 c = saturate(%s.rgb); float a = saturate(%s.a); %s = float4(c, a); }\n", ce, ae, dst);
+            sb_printf(b, "  { float3 c = %s(%s.rgb%s); float a = saturate(%s.a); %s = float4(c, a); }\n", k->hdr_in ? "clamp" : "saturate",
+                ce, k->hdr_in ? ", 0.0, 4.0" : "", ae, dst);
         }
         else /* alpha disabled: the alpha carries on unchanged */
-            sb_printf(b, "  { float3 c = saturate(%s.rgb); %s = float4(c, %s.a); }\n", ce, dst, i ? "cur" : "in.d");
+            sb_printf(b, "  { float3 c = %s(%s.rgb%s); %s = float4(c, %s.a); }\n", k->hdr_in ? "clamp" : "saturate", ce,
+                k->hdr_in ? ", 0.0, 4.0" : "", dst, i ? "cur" : "in.d");
     }
     if (k->specular_add)
-        sb_printf(b, "  cur.rgb = saturate(cur.rgb + in.s.rgb);\n");
+        sb_printf(b, "  cur.rgb = %s(cur.rgb + in.s.rgb%s);\n", k->hdr_in ? "clamp" : "saturate", k->hdr_in ? ", 0.0, 4.0" : "");
     emit_fs_tail(b, k, "cur");
 }
 
@@ -623,6 +629,7 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
     Sb b = { 0 };
     sb_printf(&b, "%s", PRELUDE);
     g_rt_pos = vk->prog ? gfx_msl_vs1_pos_consts(vs_tokens) : -1;
+    g_msl_hdr_in = fk->hdr_in;
     g_rt_wn = vk->rt && fk->rt && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
     g_mrt_n = fk->mrt == 1 && vk->el[GFX_R_NORMAL].used && !vk->rhw && (!vk->prog || g_rt_pos >= 0);
     /* traced: what the back end gives each draw (buffer 5, RtDraw in gfx_metal.m): clip space to the

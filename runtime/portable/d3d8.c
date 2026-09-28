@@ -2983,8 +2983,32 @@ static void scene_note(GfxDraw* d)
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
-        if ((sampled && large) || (effect && !g_scene.late_world && !mrt_on))
+        /* (sampled by a screen-space draw - the world put on the screen: not a 3D one that reads it, the sea's
+         * surface - lit then, everything after it went unlit and cast nothing: the trees, the characters) */
+        if (sampled && large && !d->vs.rhw)
+        {
+            static int told;
+            if (!told++)
+                fprintf(stderr, "[recomp] d3d8: the world read by a 3D draw (vs %08x, %u prims, blend %d, zwrite %d): not its end\n",
+                    d->vs.prog, d->count, d->pipe.blend, d->depth.zwrite);
+        }
+        if ((sampled && large && d->vs.rhw) || (effect && !g_scene.late_world && !mrt_on))
+        {
             g_scene.final_done = 1, gfx_world_final();
+            /* the check: what ended it (with FFXI_FINALLOG=1), a line a second */
+            static int logon = -1;
+            static uint32_t last;
+            if (logon < 0)
+                logon = getenv("FFXI_FINALLOG") != NULL;
+            if (logon && g_ws_frame - last >= 60)
+            {
+                last = g_ws_frame;
+                Obj* t0 = obj(g_dev.cur.tex[0]);
+                fprintf(stderr, "[recomp] final: frame %u by %s: target %ux%u%s, tex0 %ux%u, %u prims, blend %d %u/%u, world draws so far %u\n",
+                    g_ws_frame, sampled ? "sampled" : "effect", rt->width, rt->height, g_dev.rt == g_dev.backbuffer ? " (back buffer)" : "",
+                    t0 ? t0->width : 0, t0 ? t0->height : 0, d->count, d->pipe.blend, d->pipe.src, d->pipe.dst, g_scene.draws);
+            }
+        }
     }
     /* the world's own draws after it (the zone's shaders or fogged): lit wrongly - a later trigger for a while */
     if (g_scene.final_done && !d->vs.rhw && c == g_scene.rt && d->depth.zenable && d->depth.zwrite &&
@@ -2998,7 +3022,7 @@ static void scene_note(GfxDraw* d)
         /* the scene drawn somewhere as large as the screen (copied into the target the interface goes
          * on, or onto the back buffer): not the sun flare's occlusion probe, which copies it into
          * 16x16 - several times a frame, while the world is still being drawn */
-        if (sampled && large)
+        if (sampled && large && d->vs.rhw)
             scene_finish("sampled");
         /* the interface over the scene - on the back buffer, or into the scene's own target: FFXI draws
          * nameplates and floating text there, blended, before it draws the scene onto the back buffer;
