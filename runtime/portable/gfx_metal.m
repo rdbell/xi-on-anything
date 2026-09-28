@@ -551,7 +551,8 @@ GfxTex* gfx_tex_create(int type, uint32_t fmt, uint32_t w, uint32_t h, uint32_t 
         else
         {
             d.storageMode = MTLStorageModePrivate;
-            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | (swizzled ? MTLTextureUsagePixelFormatView : 0);
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
+                (swizzled || t->has_stencil ? MTLTextureUsagePixelFormatView : 0); /* (the stencil read apart: rt_defer) */
         }
         t->tex = [g_dev newTextureWithDescriptor:d];
         [d release];
@@ -1212,6 +1213,10 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     /* the world's opaque draws traced: shaded by the scene's triangles as they are drawn (rt_draw_bind) */
     if (rt_draw_wanted(d))
         k.lib.vs.rt = k.lib.fs.rt = 1;
+    /* the interface onto the world before its lighting: marking the stencil (rt_defer) */
+    int ov = d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment();
+    if (ov)
+        k.lib.fs.overlay = 1;
     /* the volumetric fog (vfog): the world drawn clear, its fog put in after it (rt_defer_pass) */
     if (g_fxs.vfog != 0.0f && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && (d->caster || d->receive) && !d->vs.rhw &&
         g_rt == g_vfog_target) /* (the world's own target: what goes elsewhere - a shot faded in - keeps its fog) */
@@ -1650,9 +1655,19 @@ static void draw_encode(const GfxDraw* d)
         GfxDepthKey dk = d->depth;
         if (!depth_attachment())
             memset(&dk, 0, sizeof dk);
-        [g_enc setDepthStencilState:depth_state(&dk)];
-        if (dk.stencil)
-            [g_enc setStencilReferenceValue:d->stencil_ref];
+        if (d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment() && !dk.stencil)
+        {
+            /* the interface over the world, before it is lit: its pixels marked in stencil bit 0x80 */
+            dk.stencil = 1, dk.sfunc = 8, dk.sfail = dk.szfail = 1, dk.spass = 3, dk.sread = 0, dk.swrite = 0x80;
+            [g_enc setDepthStencilState:depth_state(&dk)];
+            [g_enc setStencilReferenceValue:0x80];
+        }
+        else
+        {
+            [g_enc setDepthStencilState:depth_state(&dk)];
+            if (dk.stencil)
+                [g_enc setStencilReferenceValue:d->stencil_ref];
+        }
         /* D3D's front faces are clockwise on screen; CULL_CCW (the default) culls the back ones */
         [g_enc setFrontFacingWinding:MTLWindingClockwise];
         [g_enc setCullMode:d->cull == 3 ? MTLCullModeBack : d->cull == 2 ? MTLCullModeFront : MTLCullModeNone];
@@ -4246,9 +4261,15 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
             if (fabs(o[3]) > 1e-9)
             {
                 double x = o[0] / o[3], y = o[1] / o[3], z = o[2] / o[3];
-                /* fixed function: back in the world, less the camera's place - or already so, a view with
-                 * the camera's place left out (the sky's) */
-                int sky = inv && x * x + y * y + z * z < 4.0;
+                /* fixed function: its own view's eye (the sky's view leaves the camera's place out: its eye
+                 * is the world's origin - not an object's place: characters are drawn from vertices in the
+                 * world, their own transform none) */
+                int sky = 0;
+                if (inv && fabs(inv[11]) > 1e-12)
+                {
+                    double ex = inv[8] / inv[11], ey = inv[9] / inv[11], ez = inv[10] / inv[11];
+                    sky = ex * ex + ey * ey + ez * ez < 1.0;
+                }
                 if (inv)
                     x -= cam[0], y -= cam[1], z -= cam[2];
                 if (sky || x * x + y * y + z * z < 4.0)
@@ -4516,9 +4537,11 @@ static const char DS_MSL[] =
     "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
     "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
     "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
-    "                      texture2d<float> fd [[texture(5)]]) {\n"
+    "                      texture2d<float> fd [[texture(5)]], texture2d<uint> st [[texture(6)]]) {\n"
     "  int2 px = int2(in.pos.xy);\n"
     "  float4 col = src.read(uint2(px));\n"
+    /* the interface drawn onto the world before it was lit: left as it is */
+    "  if (d.pl.z > 0.0 && (st.read(uint2(px)).r & 0x80u) != 0u) return col;\n"
     /* rt_debug 6: the bounce light's map itself */
     "  if (d.k.z > 5.5 && d.k.z < 6.5) {\n"
     "    float2 uv = (in.pos.xy - d.vp.xy) / d.vp.zw; uv.x = uv.x * d.vp.w / d.vp.z;\n"
@@ -4960,6 +4983,11 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 sliceCount:1 levelCount:1];
         [b endEncoding];
     }
+    /* the stencil (the interface's marks, bit 0x80) read through a view of the depth */
+    id<MTLTexture> sview = nil;
+    if (dep.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && (dep.usage & MTLTextureUsagePixelFormatView))
+        sview = [dep newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    u.pl[2] = sview ? 1.0f : 0.0f;
     /* (too large to pass inline: in this frame's ring) */
     id<MTLBuffer> ub;
     NSUInteger uoff;
@@ -5007,9 +5035,49 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     [e setFragmentTexture:g_sm.fogt atIndex:4];
     [e setFragmentTexture:g_sm.fogd atIndex:5];
     [e setFragmentTexture:g_sm.ccopy atIndex:2];
+    [e setFragmentTexture:sview ? sview : g_sm.ccopy atIndex:6];
     [e setFragmentTexture:g_sm.rsm atIndex:3];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+    if (sview)
+    {
+        /* the marks cleared (stencil bit 0x80 zeroed everywhere) */
+        static id<MTLDepthStencilState> clr;
+        static id<MTLRenderPipelineState> cpipe;
+        if (!clr)
+        {
+            MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+            MTLStencilDescriptor* sd = [[MTLStencilDescriptor alloc] init];
+            sd.stencilCompareFunction = MTLCompareFunctionAlways;
+            sd.depthStencilPassOperation = MTLStencilOperationZero;
+            sd.readMask = 0, sd.writeMask = 0x80;
+            dd.frontFaceStencil = dd.backFaceStencil = sd;
+            dd.depthCompareFunction = MTLCompareFunctionAlways, dd.depthWriteEnabled = NO;
+            clr = [g_dev newDepthStencilStateWithDescriptor:dd];
+            [sd release], [dd release];
+            MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+            id<MTLFunction> vf = [g_sm.dlib newFunctionWithName:@"ds_vs"];
+            pd.vertexFunction = vf;
+            pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            NSError* err = nil;
+            cpipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            [vf release], [pd release];
+        }
+        if (cpipe && clr)
+        {
+            MTLRenderPassDescriptor* cp = [MTLRenderPassDescriptor renderPassDescriptor];
+            cp.depthAttachment.texture = dep, cp.stencilAttachment.texture = dep;
+            cp.depthAttachment.loadAction = cp.stencilAttachment.loadAction = MTLLoadActionLoad;
+            cp.depthAttachment.storeAction = cp.stencilAttachment.storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> ce = [cmd() renderCommandEncoderWithDescriptor:cp];
+            [ce setRenderPipelineState:cpipe];
+            [ce setDepthStencilState:clr];
+            [ce setViewport:(MTLViewport){ 0, 0, (double)dep.width, (double)dep.height, 0, 1 }];
+            [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [ce endEncoding];
+        }
+        [sview release];
+    }
 }
 
 static void rt_cam_log(const char* what);
@@ -6290,7 +6358,7 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                     double lo = fmax(g_fxs.rt_sun_min, 0.0) * M_PI / 180.0, el = a <= M_PI / 2 ? a : M_PI - a;
                     double e = fmax(el, lo), az = a <= M_PI / 2 ? 0.0 : M_PI;
                     u.sunw[0] = (float)(cos(e) * cos(az)), u.sunw[1] = (float)-sin(e), u.sunw[2] = 0.0f, u.sunw[3] = 1.0f;
-                    float fade = fminf(fmaxf((float)(el / (8.0 * M_PI / 180.0)), 0.0f), 1.0f);
+                    float fade = fminf(fmaxf((float)(el / (25.0 * M_PI / 180.0)), 0.0f), 1.0f);
                     strength *= (night ? g_fxs.rt_moon : 1.0f) * fade * fade * (3.0f - 2.0f * fade);
                     g_rtx.game_hour = (float)h;
                 }

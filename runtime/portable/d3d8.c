@@ -2844,6 +2844,7 @@ static struct
     uint32_t after_final, st_after_final, st_after_frames, st_after_max, st_final_present; /* the check */
     char after_note[160];
     uint32_t world_after; /* the world's own draws after the lighting this frame */
+    uint32_t st_late_frames, st_world_after_max;
     uint32_t late_world;  /* frames left to light the world at its end rather than at its effects */
     struct { GfxTex* t; uint32_t n; } tally[4]; /* this frame's 3D draws per target */
     uint32_t draws; /* 3D draws to it since the effects last ran */
@@ -2908,7 +2909,7 @@ static void scene_finish(const char* why)
 
 static void scene_note(GfxDraw* d)
 {
-    d->caster = 0, d->receive = 0;
+    d->caster = 0, d->receive = 0, d->overlay = 0;
     uint32_t face, level;
     Obj* rt = obj(g_dev.rt);
     GfxTex* c = rt ? surface_gpu(rt, &face, &level) : NULL;
@@ -2922,23 +2923,29 @@ static void scene_note(GfxDraw* d)
             snprintf(g_scene.after_note, sizeof g_scene.after_note, "same target %d, zenable %d, zwrite %d, blend %d, vs %08x, prims %u",
                 c == g_scene.rt, d->depth.zenable, d->depth.zwrite, d->pipe.blend, d->vs.prog, d->count);
     }
+    /* the interface onto the world before it is lit: kept out of the lighting (the back end marks it) */
+    if (d->vs.rhw && c == g_scene.rt && !g_scene.final_done)
+        d->overlay = 1;
     /* the world sampled for the screen - complete, whatever came after its effects - or the interface
      * (nameplates, text) drawn onto it: the back end's lighting of the world goes under that */
     /* ... or, unless the world's own draws went on after its effects lately (the title's flythrough), at
      * the effects' first draw (blended, no depth written, unfogged): they always go over the lighting,
      * never sometimes under it as the interface's first draw comes before or after them */
-    int effect = !d->vs.rhw && c == g_scene.rt && d->depth.zenable && !d->depth.zwrite && d->pipe.blend && !d->fs.fog &&
-        !d->vs.fog_vertex;
+    /* (blended, writing no depth: every see-through draw - glows, spells, and the world's own see-through
+     * pieces, a door drawn over its alcove - which come in order of distance: lit, a piece among them would be
+     * lit or not as it came before or after the first) */
+    int effect = !d->vs.rhw && c == g_scene.rt && d->depth.zenable && !d->depth.zwrite && d->pipe.blend;
     if (g_scene.world_done && !g_scene.final_done)
     {
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
-        if ((sampled && large) || (d->vs.rhw && c == g_scene.rt) || (effect && !g_scene.late_world))
+        if ((sampled && large) || (effect && !g_scene.late_world))
             g_scene.final_done = 1, gfx_world_final();
     }
     /* the world's own draws after it (the zone's shaders or fogged): lit wrongly - a later trigger for a while */
-    if (g_scene.final_done && !d->vs.rhw && c == g_scene.rt && d->depth.zenable && (d->vs.prog || d->fs.fog || d->vs.fog_vertex))
+    if (g_scene.final_done && !d->vs.rhw && c == g_scene.rt && d->depth.zenable && d->depth.zwrite &&
+        (d->vs.prog || d->fs.fog || d->vs.fog_vertex)) /* (solid: its see-through pieces come after by their nature) */
         g_scene.world_after++;
     if (g_scene.draws && !g_scene.done)
     {
@@ -3085,6 +3092,9 @@ static void scene_present(void)
         g_scene.st_after_max = g_scene.after_final;
     g_scene.after_final = 0;
     g_scene.final_done = 0;
+    g_scene.st_late_frames += g_scene.late_world > 0;
+    if (g_scene.world_after > g_scene.st_world_after_max)
+        g_scene.st_world_after_max = g_scene.world_after;
     if (g_scene.world_after > 20)
         g_scene.late_world = 300;
     else if (g_scene.late_world)
@@ -3107,8 +3117,10 @@ static void scene_present(void)
             g_scene.rt == g_scene.world ? "the world's view" : "another target", g_scene.st_why[0], g_scene.st_why[1], g_scene.st_why[2],
             g_scene.st_why[3], g_scene.st_cam[2], g_scene.st_cam[1], g_scene.st_cam[0],
             g_scene.st_late, g_scene.st_over, g_scene.st_over_rhw);
-        fprintf(stderr, "[recomp] d3d8: world final: at present %u; 3D drawn after it in %u frames, %u draws, at most %u (%s)\n",
-            g_scene.st_final_present, g_scene.st_after_frames, g_scene.st_after_final, g_scene.st_after_max, g_scene.after_note);
+        fprintf(stderr, "[recomp] d3d8: world final: at present %u; 3D drawn after it in %u frames, %u draws, at most %u (%s); "
+            "late %u frames, world after at most %u\n", g_scene.st_final_present, g_scene.st_after_frames, g_scene.st_after_final,
+            g_scene.st_after_max, g_scene.after_note, g_scene.st_late_frames, g_scene.st_world_after_max);
+        g_scene.st_late_frames = g_scene.st_world_after_max = 0;
         g_scene.after_note[0] = 0;
         g_scene.st_final_present = g_scene.st_after_frames = g_scene.st_after_final = g_scene.st_after_max = 0;
         memset(g_scene.st_why, 0, sizeof g_scene.st_why), memset(g_scene.st_cam, 0, sizeof g_scene.st_cam);

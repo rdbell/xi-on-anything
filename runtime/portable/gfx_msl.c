@@ -522,6 +522,8 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
     }
     if (k->rt)
         sb_printf(b, "  %s.rgb *= 1.0 - rd.k.x * rt_w * (1.0 - rt_vis);\n", col);
+    if (k->overlay) /* only what shows marks the stencil */
+        sb_printf(b, "  if (%s.a < 0.02) discard_fragment();\n", col);
     if (k->fog)
     {
         if (k->fog == 4)
