@@ -2465,7 +2465,7 @@ static const struct
     { "rt_sun_azim", offsetof(__typeof__(g_fxs), rt_sun_azim), 0.0f },
     /* the traced sun shadows, in the world's own draws: how much of a surface's colour the shadow
      * takes (0: none - and the sun's maps back), and how far out they reach, in world units */
-    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.45f },
+    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.75f },
     { "rt_distance", offsetof(__typeof__(g_fxs), rt_distance), 500.0f },
     /* how far the near shadow map reaches (the finer one, round the camera), in world units */
     { "rt_near", offsetof(__typeof__(g_fxs), rt_near), 25.0f },
@@ -2483,7 +2483,7 @@ static const struct
     { "rt_moon", offsetof(__typeof__(g_fxs), rt_moon), 0.4f },
     { "rt_point_far", offsetof(__typeof__(g_fxs), rt_point_far), 60.0f },
     { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 48.0f },
-    { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 0.35f },
+    { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 1.0f },
     { "rt_sun_min", offsetof(__typeof__(g_fxs), rt_sun_min), 20.0f },
     { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
