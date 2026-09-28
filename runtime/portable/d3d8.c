@@ -1062,12 +1062,23 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
 
 static void ui_present(void);
 static uint32_t g_ws_frame = 1; /* frames presented (world_smooth) */
+static int g_vtxlog;              /* the check: vtx_log on */
 
 static void IDirect3DDevice8_Present(Guest* g)
 {
     cap_present();
     scene_present();
     g_ws_frame++;
+    { /* the game's clock (0x100dc060 reads it: [[0x10492e10] + 0xc], Unix seconds by the server) for the sun */
+        uint32_t p = rd32(0x10492e10u);
+        uint32_t t = p ? rd32(p + 0xc) : 0;
+        if (t > 1000000000u)
+            gfx_note_clock(t);
+    }
+    {
+        struct stat st;
+        g_vtxlog = !stat("/tmp/ffxi_vtxlog", &st);
+    }
     ui_present();
     if (g_present_hook)
         g_present_hook();
@@ -3168,11 +3179,11 @@ static void scene_present(void)
  * where it stands, goes from the one shown before to the newest over the frames between the game's updates:
  * smooth at the frame rate, one update behind (anim_smooth in fx.txt; 0 off). Not what is drawn with no
  * world matrix of its own (characters, skinned into the world). */
-enum { WS_N = 4096, WS_PROBE = 8, WS_GAP = 8 };
+enum { WS_N = 8192, WS_PROBE = 48, WS_GAP = 8 };
 typedef struct
 {
     uint64_t key;
-    float from[16], to[16], shown[16];
+    float from[16], to[16], shown[16], raw[16];
     uint32_t t_to, gap, seen;
 } WsEnt;
 static WsEnt g_ws[WS_N];
@@ -3206,26 +3217,37 @@ static void world_smooth(GfxDraw* d, uint32_t start, uint32_t indices, uint32_t 
         why[4]++;
         return;
     }
+    /* the mesh; which of its copies by where it stands - the nearest of this mesh's kept last frame */
     uint64_t h = 1469598103934665603ull;
-    uint32_t parts[7] = { s->stream[0], s->ib, start, indices, n, (uint32_t)(int32_t)floorf(W[12] * 0.25f),
-        (uint32_t)(int32_t)floorf(W[14] * 0.25f) };
-    for (int i = 0; i < 7; ++i)
+    uint32_t parts[5] = { s->stream[0], s->ib, start, indices, n };
+    for (int i = 0; i < 5; ++i)
         h = (h ^ parts[i]) * 1099511628211ull;
     h |= 1;
     WsEnt* e = NULL;
     WsEnt* spare = NULL;
+    float best = 0.3f; /* (one further from every kept is another) */
+    int taken = 0;
     for (int i = 0; i < WS_PROBE; ++i)
     {
         WsEnt* c = &g_ws[(h + (uint64_t)i) % WS_N];
-        if (c->key == h)
+        if (c->key == h && g_ws_frame - c->seen <= 1)
         {
-            e = c;
-            break;
+            /* the whole matrix: copies at one place turned differently (a palm's fronds) are others */
+            float dd = 0.0f;
+            for (int j = 0; j < 16; ++j)
+                dd += fabsf(W[j] - c->to[j]) * (j >= 12 ? 0.25f : 1.0f);
+            if (dd < best)
+            {
+                if (c->seen == g_ws_frame)
+                    taken = 1;
+                else
+                    best = dd, e = c;
+            }
         }
-        if (!spare && (!c->key || g_ws_frame - c->seen > 120))
+        else if (!spare && (!c->key || g_ws_frame - c->seen > 1))
             spare = c;
     }
-    if (e && e->seen == g_ws_frame) /* two of it in one place this frame: which is which unknown */
+    if (!e && taken) /* its place taken this frame by another copy: which is which unknown */
     {
         why[5]++;
         return;
@@ -3242,7 +3264,7 @@ static void world_smooth(GfxDraw* d, uint32_t start, uint32_t indices, uint32_t 
     }
     if (fresh)
     {
-        memcpy(e->from, W, 64), memcpy(e->to, W, 64), memcpy(e->shown, W, 64);
+        memcpy(e->from, W, 64), memcpy(e->to, W, 64), memcpy(e->shown, W, 64), memcpy(e->raw, W, 64);
         e->t_to = g_ws_frame, e->gap = 1, e->seen = g_ws_frame;
         return;
     }
@@ -3263,11 +3285,251 @@ static void world_smooth(GfxDraw* d, uint32_t start, uint32_t indices, uint32_t 
     float Ws[16], wv[16];
     for (int i = 0; i < 16; ++i)
         Ws[i] = e->from[i] + (e->to[i] - e->from[i]) * f;
+    if (g_vtxlog) /* the check: how much its matrix moved this frame as the game gave it and as shown */
+    {
+        static FILE* tf;
+        if (!tf)
+            tf = fopen("/tmp/ffxi_ws_traj.txt", "w");
+        float dr = 0.0f, ds = 0.0f;
+        for (int i = 0; i < 16; ++i)
+            dr = fmaxf(dr, fabsf(W[i] - e->raw[i])), ds = fmaxf(ds, fabsf(Ws[i] - e->shown[i]));
+        if (tf)
+            fprintf(tf, "%u %ld %u %.5f %.5f %.2f\n", g_ws_frame, (long)(e - g_ws), n, dr, ds, e->gap / 1.0f);
+    }
+    memcpy(e->raw, W, 64);
     memcpy(e->shown, Ws, 64);
     mat_mul(wv, Ws, s->xf[2]);
     mat_mul(d->u.wvp, wv, s->xf[3]);
     memcpy(d->u.wv, wv, 64);
     normal_matrix(d->u.wvit, wv);
+}
+
+/* The same for what the game animates in its vertices (the trees' fronds, grass, far characters): written
+ * anew only when it updates them - every other frame at 60, now and then two frames running or neither - so
+ * they moved in stutters. Each such draw (its vertices from memory the game writes, not a buffer it keeps),
+ * found again the next frame by its mesh and the nearest of its copies, has its positions eased from those
+ * shown to the newest over the frames the game takes between updates (anim_smooth). */
+enum { VT_N = 4096, VT_PROBE = 32, VT_MAXV = 16384 };
+typedef struct
+{
+    uint64_t key;
+    uint32_t seen, last, nv; /* last: the frame its newest update came in */
+    float gap;               /* frames between the game's updates, steadied */
+    double ta, tb;           /* the two newest updates' times on an even beat (frames) */
+    float *pa, *pb, *shown;  /* their positions, and what was drawn */
+    uint8_t* out;
+    uint32_t out_cap;
+} VtEnt;
+static VtEnt g_vt[VT_N];
+
+static void vtx_pos(float* o, const uint8_t* src, uint32_t nv, uint32_t stride, uint32_t off)
+{
+    for (uint32_t i = 0; i < nv; ++i)
+        memcpy(o + 3 * i, src + (size_t)i * stride + off, 12);
+}
+
+static void vtx_smooth(GfxDraw* d, uint32_t nverts, uint32_t n)
+{
+    static uint32_t on_frame;
+    static int on;
+    if (on_frame != g_ws_frame)
+        on_frame = g_ws_frame, on = gfx_fx_get("anim_smooth") != 0.0f;
+    const GfxElem* ep = &d->vs.el[GFX_R_POSITION];
+    if (!on || d->vs.prog || d->vs.rhw || !d->data[0] || d->buf[0] || !ep->used || ep->stream || (ep->type != 2 && ep->type != 3))
+        return;
+    uint32_t stride = (uint32_t)d->u.stride[0], off = (uint32_t)d->u.offset[GFX_R_POSITION];
+    if (stride < off + 12 || nverts < 3 || nverts > VT_MAXV || (uint64_t)nverts * stride > d->size[0])
+        return;
+    const uint8_t* src = (const uint8_t*)d->data[0];
+    uint64_t h = 1469598103934665603ull;
+    uint32_t parts[4] = { g_dev.cur.stream[0], nverts, stride, n };
+    for (int i = 0; i < 4; ++i)
+        h = (h ^ parts[i]) * 1099511628211ull;
+    h |= 1;
+    float p0[3], pm[3];
+    memcpy(p0, src + off, 12), memcpy(pm, src + (size_t)(nverts / 2) * stride + off, 12);
+    VtEnt* e = NULL;
+    VtEnt* spare = NULL;
+    float best = 2.0f; /* (a copy further from every one kept is another) */
+    for (int i = 0; i < VT_PROBE; ++i)
+    {
+        VtEnt* c = &g_vt[(h + (uint64_t)i) % VT_N];
+        if (c->key == h && c->nv == nverts && g_ws_frame - c->seen <= 1 && c->seen != g_ws_frame)
+        {
+            const float* a = c->pb;
+            const float* m = c->pb + 3 * (nverts / 2);
+            float dd = fabsf(p0[0] - a[0]) + fabsf(p0[1] - a[1]) + fabsf(p0[2] - a[2]) + fabsf(pm[0] - m[0]) + fabsf(pm[1] - m[1]) +
+                fabsf(pm[2] - m[2]);
+            if (dd < best)
+                best = dd, e = c;
+        }
+        else if (!spare && (!c->key || g_ws_frame - c->seen > 2))
+            spare = c;
+    }
+    if (!e)
+    {
+        if (!spare)
+            return;
+        e = spare;
+        if (e->nv != nverts || !e->pa)
+        {
+            free(e->pa), free(e->pb), free(e->shown);
+            e->pa = (float*)malloc(12u * nverts), e->pb = (float*)malloc(12u * nverts), e->shown = (float*)malloc(12u * nverts);
+            if (!e->pa || !e->pb || !e->shown)
+            {
+                free(e->pa), free(e->pb), free(e->shown), free(e->out);
+                memset(e, 0, sizeof *e);
+                return;
+            }
+        }
+        e->key = h, e->nv = nverts, e->seen = e->last = g_ws_frame, e->gap = 1.0f;
+        e->ta = e->tb = g_ws_frame;
+        vtx_pos(e->pb, src, nverts, stride, off);
+        memcpy(e->pa, e->pb, 12u * nverts), memcpy(e->shown, e->pb, 12u * nverts);
+        return;
+    }
+    e->seen = g_ws_frame;
+    int changed = 0;
+    float jump = 0.0f;
+    for (uint32_t i = 0; i < nverts; ++i)
+    {
+        const float* v = (const float*)(src + (size_t)i * stride + off);
+        const float* t = e->pb + 3 * i;
+        float dd = fabsf(v[0] - t[0]) + fabsf(v[1] - t[1]) + fabsf(v[2] - t[2]);
+        changed |= dd != 0.0f;
+        jump = fmaxf(jump, dd);
+    }
+    if (changed)
+    {
+        uint32_t g = g_ws_frame - e->last;
+        g = g < 1 ? 1 : g > 6 ? 6 : g;
+        e->gap = e->gap * 0.8f + (float)g * 0.2f;
+        e->last = g_ws_frame;
+        /* its time: a beat after the one before (the game's pace, however its updates fell among the frames),
+         * kept within a beat of when it came */
+        double t = e->tb + e->gap;
+        if (t < g_ws_frame - 2.0 * e->gap - 1.0 || t > g_ws_frame + 2.0 * e->gap + 1.0 || jump > 2.0f)
+            t = g_ws_frame;
+        if (jump > 2.0f) /* a jump (another pose, or it moved away): at once */
+        {
+            vtx_pos(e->pa, src, nverts, stride, off);
+            e->ta = t - e->gap;
+        }
+        else
+            memcpy(e->pa, e->pb, 12u * nverts), e->ta = e->tb;
+        vtx_pos(e->pb, src, nverts, stride, off);
+        e->tb = t;
+    }
+    /* updated every frame: as it is */
+    if (e->gap < 1.02f)
+    {
+        vtx_pos(e->shown, src, nverts, stride, off);
+        return;
+    }
+    /* drawn a beat behind: between the two updates either side of then */
+    double td = (double)g_ws_frame - e->gap;
+    float f = e->tb - e->ta > 1e-3 ? (float)((td - e->ta) / (e->tb - e->ta)) : 1.0f;
+    f = f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
+    size_t bytes = (size_t)nverts * stride;
+    if (e->out_cap < bytes)
+    {
+        uint8_t* o = (uint8_t*)realloc(e->out, bytes);
+        if (!o)
+            return;
+        e->out = o, e->out_cap = (uint32_t)bytes;
+    }
+    memcpy(e->out, src, bytes);
+    for (uint32_t i = 0; i < 3 * nverts; ++i)
+        e->shown[i] = e->pa[i] + (e->pb[i] - e->pa[i]) * f;
+    for (uint32_t i = 0; i < nverts; ++i)
+        memcpy(e->out + (size_t)i * stride + off, e->shown + 3 * i, 12);
+    d->data[0] = e->out;
+    if (g_vtxlog) /* the check: each one's first vertex as the game gave it and as drawn */
+    {
+        static FILE* tf;
+        if (!tf)
+            tf = fopen("/tmp/ffxi_vt_traj.txt", "w");
+        if (tf)
+            fprintf(tf, "%u %ld %u %.4f %.4f %.4f %.4f %.4f %.4f %.2f %d\n", g_ws_frame, (long)(e - g_vt), nverts, p0[0], p0[1], p0[2],
+                e->shown[0], e->shown[1], e->shown[2], e->gap, changed);
+    }
+}
+
+/* the check: each 3D draw's vertices, world matrix and shader constants hashed, a line a draw, while
+ * /tmp/ffxi_vtxlog exists (looked for once a frame) - what moves and how often (/tmp/ffxi_vtx.txt) */
+static void vtx_log(const GfxDraw* d, uint32_t first, uint32_t nverts, uint32_t indices, uint32_t n, uint32_t up_data, uint32_t up_stride)
+{
+    static FILE* f;
+    if (!g_vtxlog || d->vs.rhw)
+        return;
+    if (!f)
+        f = fopen("/tmp/ffxi_vtx.txt", "w");
+    if (!f)
+        return;
+    State* s = &g_dev.cur;
+    uint32_t stride = up_data ? up_stride : s->stride[0], base = up_data;
+    Obj* b = up_data ? NULL : obj(s->stream[0]);
+    uint32_t size = up_data ? 0xFFFFFFFFu : b && b->mem ? b->size : 0;
+    if (b)
+        base = b->mem;
+    uint64_t hv = 1469598103934665603ull, hw = hv, hc = hv;
+    uint32_t a = first * stride, bytes = nverts * stride;
+    if (base && a < size)
+    {
+        if (bytes > size - a)
+            bytes = size - a;
+        if (bytes > 65536)
+            bytes = 65536;
+        const uint8_t* p = (const uint8_t*)GUEST_PTR(base + a);
+        for (uint32_t i = 0; i < bytes; ++i)
+            hv = (hv ^ p[i]) * 1099511628211ull;
+    }
+    const uint8_t* w = (const uint8_t*)s->xf[24];
+    for (int i = 0; i < 64; ++i)
+        hw = (hw ^ w[i]) * 1099511628211ull;
+    if (d->vs.prog)
+    {
+        const uint8_t* c = (const uint8_t*)d->u.vsc[4];
+        for (int i = 0; i < 16 * 92; ++i)
+            hc = (hc ^ c[i]) * 1099511628211ull;
+    }
+    uint64_t hs = 1469598103934665603ull;
+    const uint8_t* sw = (const uint8_t*)d->u.wv;
+    for (int i = 0; i < 64; ++i)
+        hs = (hs ^ sw[i]) * 1099511628211ull;
+    if (!d->vs.prog && base && a < size && stride >= 12)
+    {
+        static FILE* pf;
+        if (!pf)
+            pf = fopen("/tmp/ffxi_vpos.txt", "w");
+        if (pf)
+        {
+            fprintf(pf, "%u %u %u %u %u", g_ws_frame, s->stream[0], first, nverts, n);
+            for (uint32_t i = 0; i < nverts && i < 64; i += 8)
+            {
+                const float* v = d->data[0] && !d->buf[0] ? (const float*)((const uint8_t*)d->data[0] + i * stride) /* (as drawn) */
+                                                          : (const float*)GUEST_PTR(base + a + i * stride);
+                fprintf(pf, " %.4f %.4f %.4f", v[0], v[1], v[2]);
+            }
+            fputc('\n', pf);
+        }
+    }
+    if (d->vs.prog)
+    {
+        static FILE* cf;
+        if (!cf)
+            cf = fopen("/tmp/ffxi_vsc.txt", "w");
+        if (cf)
+        {
+            fprintf(cf, "%u %u %u %u %u %08x", g_ws_frame, s->stream[0], first, nverts, n, d->vs.prog);
+            for (int r = 0; r < 32; ++r)
+                fprintf(cf, " %g %g %g %g", d->u.vsc[r][0], d->u.vsc[r][1], d->u.vsc[r][2], d->u.vsc[r][3]);
+            fputc('\n', cf);
+        }
+    }
+    fprintf(f, "%u %u %u %u %u %u %u vs %d up %d blend %u v %016llx w %016llx c %016llx s %016llx\n", g_ws_frame, s->stream[0], s->ib,
+        first, nverts, indices ? indices : 0, n, d->vs.prog != 0, up_data != 0, s->rs[151], (unsigned long long)hv,
+        (unsigned long long)hw, (unsigned long long)hc, (unsigned long long)hs);
 }
 
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
@@ -3382,6 +3644,8 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     if (!set_streams(d, first, nverts, up_data, up_stride))
         return;
     world_smooth(d, start, indices, n);
+    vtx_smooth(d, nverts, n);
+    vtx_log(d, first, nverts, indices, n, up_data, up_stride);
     scene_note(d);
     if (g_cap)
         cap_draw(d, prim, count, first, nverts, up_data, up_stride);

@@ -156,7 +156,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_decal, anim_smooth, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_late_size, rt_point_day, rt_decal, anim_smooth, rt_sun_step, rt_cascade_cam, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, hdr_output, hdr_peak, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -1350,6 +1350,7 @@ static struct
  * middle - a fixed-function one's in the world (its own camera), a shader's in the frame's clip space -
  * a light there (rt_glow) */
 enum { RT_GLOWS = 64 };
+static double g_frame_cam[3]; /* the frame's camera's place (the maps' g_sm.cam, kept for the glows) */
 static struct
 {
     double p[RT_GLOWS][4]; /* world (w 1) or clip (w the clip's) */
@@ -1680,6 +1681,14 @@ void gfx_draw(const GfxDraw* d)
             for (int j = 0; j < 16; ++j)
                 vp[j] = d->view_proj[j];
             ok = matd_inverse(inv, vp);
+            /* not the sun's and moon's: drawn through the sky's view, its eye the world's origin rather than the
+             * camera's place - taken for a lamp there, it lit whatever stood behind them (magenta by the moon) */
+            if (ok && fabs(inv[11]) > 1e-12)
+            {
+                double ex = inv[8] / inv[11] - g_frame_cam[0], ey = inv[9] / inv[11] - g_frame_cam[1], ez = inv[10] / inv[11] - g_frame_cam[2];
+                if (ex * ex + ey * ey + ez * ez > 25.0)
+                    ok = 0;
+            }
             for (int j = 0; ok && j < 4; ++j)
                 o[j] = c[0] * inv[j] + c[1] * inv[4 + j] + c[2] * inv[8 + j] + c[3] * inv[12 + j];
             if (ok && fabs(o[3]) > 1e-12)
@@ -2641,6 +2650,8 @@ static const struct
     { "rt_late_size", offsetof(__typeof__(g_fxs), rt_late_size), 6.0f },
     { "rt_decal", offsetof(__typeof__(g_fxs), rt_decal), 1.0f },
     { "anim_smooth", offsetof(__typeof__(g_fxs), anim_smooth), 1.0f },
+    { "rt_sun_step", offsetof(__typeof__(g_fxs), rt_sun_step), 0.0f },
+    { "rt_cascade_cam", offsetof(__typeof__(g_fxs), rt_cascade_cam), 1.0f },
     { "rt_point_day", offsetof(__typeof__(g_fxs), rt_point_day), 0.15f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
@@ -4355,6 +4366,13 @@ static int rt_cascade(const double* vpinv, const double* cam, const double* L, d
         R = fmax(R, sqrt(dx * dx + dy * dy + dz * dz));
     }
     R = ceil(R); /* whole units: the texel's size holds still */
+    /* rt_cascade_cam: round the camera instead (the slice's reach for its radius) - turning the camera then
+     * moves no map: the shadows' texels hold still as it turns (round the view's slice, each turn moved them) */
+    if (g_fxs.rt_cascade_cam != 0.0f)
+    {
+        memcpy(c, cam, sizeof c);
+        R = ceil(t1);
+    }
     double fl[3] = { -L[0], -L[1], -L[2] }, up[3] = { 0, 1, 0 };
     if (fabs(fl[1]) > 0.9)
         up[0] = 1, up[1] = 0;
@@ -4365,7 +4383,8 @@ static int rt_cascade(const double* vpinv, const double* cam, const double* L, d
     double cx = floor((c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / tx) * tx;
     double cy = floor((c[0] * u[0] + c[1] * u[1] + c[2] * u[2]) / tx) * tx;
     double cz = c[0] * fl[0] + c[1] * fl[1] + c[2] * fl[2];
-    double back = 200.0, range = 2.0 * R + back, z0 = cz - R - back;
+    double back = 200.0, range = 2.0 * R + back, z0 = floor((cz - R - back) * 2.0) * 0.5; /* (its depth's origin on half
+                                                                                         * units: depths hold still too) */
     float m[16] = {
         (float)(r[0] / R), (float)(u[0] / R), (float)(fl[0] / range), 0,
         (float)(r[1] / R), (float)(u[1] / R), (float)(fl[1] / range), 0,
@@ -5000,6 +5019,16 @@ static struct
     uint64_t serial;
 } g_pl;
 
+/* the game's clock less the real one (whole seconds: changed only by more than one, as !settime does) */
+static double g_clock_off;
+static int g_clock_on;
+void gfx_note_clock(uint32_t unix_secs)
+{
+    double off = (double)unix_secs - (double)time(NULL);
+    if (!g_clock_on || fabs(off - g_clock_off) > 1.5)
+        g_clock_off = off, g_clock_on = 1;
+}
+
 void gfx_note_light(const float pos[3], const float diffuse[4], float range)
 {
     if (g_pl.serial != g_serial)
@@ -5530,6 +5559,7 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
         return;
     double cam[3] = { vpinv[8] / vpinv[11], vpinv[9] / vpinv[11], vpinv[10] / vpinv[11] };
     memcpy(g_sm.cam, cam, sizeof cam);
+    memcpy(g_frame_cam, cam, sizeof cam);
     {
         char w[96];
         snprintf(w, sizeof w, "maps at %.3f %.3f %.3f casters %u late %u", cam[0], cam[1], cam[2], g_ncasters,
@@ -6792,19 +6822,22 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 if (g_fxs.rt_sun_elev == 0.0f)
                 {
                     /* the game's sun by its own clock (Vana'diel time: 25 times the Earth's, from 2002-01-01
-                     * 00:00 JST): rising toward +x at 6:00, overhead (world y down) at noon, setting at 18:00;
+                     * 00:00 JST, by the game's own clock - the server's, gfx_note_clock): rising toward +x at 6:00, overhead (world y down) at noon, setting at 18:00;
                      * the moon along the same path by night, its shadows fainter; both fading at the horizon.
                      * (The light the game gives its characters jumps with which of them are in view.) */
                     struct timespec ts;
                     clock_gettime(CLOCK_REALTIME, &ts);
-                    double t = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+                    double t = (double)ts.tv_sec + ts.tv_nsec * 1e-9 + g_clock_off; /* (the game's time) */
                     double h = fmod((t - 1009810800.0) * 25.0 / 3600.0, 24.0);
                     if (g_fxs.rt_hour >= 0.0f) /* the tester's hour */
                         h = fmod(g_fxs.rt_hour, 24.0);
                     int night = h < 6.0 || h >= 18.0;
                     double a = fmod(h - (night ? 18.0 : 6.0) + 24.0, 24.0) / 12.0 * M_PI;
                     /* in steps of a quarter degree (one every 2.4 s): the maps hold still between them */
-                    a = floor(a / (0.25 * M_PI / 180.0) + 0.5) * (0.25 * M_PI / 180.0);
+                    /* (rt_sun_step degrees; 0: smoothly - a step moved every long shadow at once, the trees' fronds'
+                     * jumping on the ground every few seconds) */
+                    if (g_fxs.rt_sun_step > 0.0f)
+                        a = floor(a / (g_fxs.rt_sun_step * M_PI / 180.0) + 0.5) * (g_fxs.rt_sun_step * M_PI / 180.0);
                     /* its height for the shadows at least rt_sun_min degrees: one near the horizon makes shadows
                      * endless and skims every face, their edges crawling as the camera moves; they fade out
                      * instead as it nears the horizon */

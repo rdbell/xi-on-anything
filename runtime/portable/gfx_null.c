@@ -139,3 +139,4 @@ void gfx_trace_dump(const char* path) { (void)path; }
 void gfx_finish(void) {}
 uint32_t gfx_failures(void) { return 0; }
 void gfx_set_sync_pipelines(int on) { (void)on; }
+void gfx_note_clock(uint32_t unix_secs) { (void)unix_secs; }

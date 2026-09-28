@@ -2450,3 +2450,4 @@ int gfx_init(void* window, int vsync)
     }
     return 1;
 }
+void gfx_note_clock(uint32_t unix_secs) { (void)unix_secs; }
