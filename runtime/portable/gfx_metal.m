@@ -2614,7 +2614,7 @@ static const struct
     { "rt_sun_azim", offsetof(__typeof__(g_fxs), rt_sun_azim), 0.0f },
     /* the traced sun shadows, in the world's own draws: how much of a surface's colour the shadow
      * takes (0: none - and the sun's maps back), and how far out they reach, in world units */
-    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.75f },
+    { "rt_shadow", offsetof(__typeof__(g_fxs), rt_shadow), 0.55f },
     { "rt_distance", offsetof(__typeof__(g_fxs), rt_distance), 500.0f },
     /* how far the near shadow map reaches (the finer one, round the camera), in world units */
     { "rt_near", offsetof(__typeof__(g_fxs), rt_near), 25.0f },
@@ -2642,8 +2642,8 @@ static const struct
     { "rt_sun_gain", offsetof(__typeof__(g_fxs), rt_sun_gain), 0.5f },
     { "hdr", offsetof(__typeof__(g_fxs), hdr), 1.0f },
     { "hdr_exposure", offsetof(__typeof__(g_fxs), hdr_exposure), 1.0f },
-    { "hdr_contrast", offsetof(__typeof__(g_fxs), hdr_contrast), 1.15f },
-    { "hdr_black", offsetof(__typeof__(g_fxs), hdr_black), 0.02f },
+    { "hdr_contrast", offsetof(__typeof__(g_fxs), hdr_contrast), 1.08f },
+    { "hdr_black", offsetof(__typeof__(g_fxs), hdr_black), 0.0f },
     { "hdr_white", offsetof(__typeof__(g_fxs), hdr_white), 1.6f },
     { "hdr_knee", offsetof(__typeof__(g_fxs), hdr_knee), 0.8f },
     { "hdr_output", offsetof(__typeof__(g_fxs), hdr_output), 1.0f },
