@@ -4583,6 +4583,7 @@ static const char DS_MSL[] =
     /* the bounce light where the sun does not reach (in full sun it is little beside it) */
     "  oc += col.rgb * gi * f * (1.0 - 0.75 * v);\n"
     /* the lamps and torches: each lights what faces it within its range, falling off smoothly */
+    "  float3 plsum = float3(0.0);\n"
     "  for (int i = 0; i < int(d.pl.x); ++i) {\n"
     "    float3 L = d.lp[i].xyz - p; float dl = length(L), r = d.lp[i].w;\n"
     "    if (dl >= r) continue;\n"
@@ -4590,10 +4591,13 @@ static const char DS_MSL[] =
     /* wrapped round the surface: the facets of the depth's own normal hardly show */
     "    float ndl = saturate(dot(n, L / max(dl, 1e-3)) * 0.35 + 0.65);\n"
     "    oc += col.rgb * d.lc[i].rgb * (d.pl.y * fall * ndl) * f;\n"
+    "    plsum += d.lc[i].rgb * (d.pl.y * fall * ndl);\n"
     "  }\n"
+    /* rt_debug 12: the point lights' light alone */
+    "  if (d.k.z > 11.5 && d.k.z < 12.5) return float4(plsum * 0.5, 1.0);\n"
     "  if (d.vf2.w > 0.0) { float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, dist); oc = oc * fo.a + fo.rgb; }\n"
     /* rt_debug 11: every light a dot where it hangs (seen through walls), its reach a faint ring */
-    "  if (d.k.z > 10.5) {\n"
+    "  if (d.k.z > 10.5 && d.k.z < 11.5) {\n"
     "    float3 dir = p / max(dist, 1e-3);\n"
     "    for (int i = 0; i < int(d.pl.x); ++i) {\n"
     "      float t = dot(d.lp[i].xyz, dir); float3 c = dir * t - d.lp[i].xyz; float e = length(c);\n"
@@ -4611,10 +4615,13 @@ static struct
 {
     double p[3];
     float c[3], r, fade;
-    uint64_t seen, fade_serial;
-    int live;
+    uint64_t seen, fade_serial, hit_serial;
+    int live, glow; /* glow: from a glow alone - a light only once it has held still (hits) */
+    uint32_t hits;
 } g_lt[RT_LKEEP];
-static uint32_t g_pl_shown; /* the profile: lights the last pass lit with */
+static uint32_t g_pl_shown, g_lt_new, g_lt_srcs[3];
+static double g_lt_move;
+static uint32_t g_lt_newsrc[3]; /* the profile: lights the last pass lit with */
 static struct
 {
     float l[2][RT_LIGHTS][8]; /* x, y, z, range, r, g, b, - */
@@ -4775,6 +4782,7 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
             u.lp[i][2] = (float)(e[2] - g_sm.cam[2]), u.lp[i][3] = e[3];
             u.lc[i][0] = e[4], u.lc[i][1] = e[5], u.lc[i][2] = e[6];
         }
+        uint32_t n_game = n;
         if (g_zl.serial == g_serial)
             for (uint32_t i = 0; i < g_zl.n && n < RT_LIGHTS; ++i)
             {
@@ -4799,6 +4807,7 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
                 memcpy(u.lc[n], g_zl.col[i], 12);
                 n++;
             }
+        uint32_t n_zone = n;
         /* the glows: lights at them, warm, rt_glow_range across */
         if (g_gl.serial == g_serial && g_fxs.rt_glow > 0.0f)
             for (uint32_t i = 0; i < g_gl.n && n < RT_LIGHTS; ++i)
@@ -4847,15 +4856,23 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
             if (k < 0)
                 for (int t = 0; t < RT_LKEEP && k < 0; ++t)
                     if (!g_lt[t].live)
-                        k = t, memset(&g_lt[t], 0, sizeof g_lt[t]), g_lt[t].live = 1, memcpy(g_lt[t].p, wp, sizeof wp),
-                        memcpy(g_lt[t].c, u.lc[i], 12), g_lt[t].r = u.lp[i][3];
+                        k = t, g_lt_new++, g_lt_newsrc[i < n_game ? 0 : i < n_zone ? 1 : 2]++, memset(&g_lt[t], 0, sizeof g_lt[t]), g_lt[t].live = 1, memcpy(g_lt[t].p, wp, sizeof wp),
+                        memcpy(g_lt[t].c, u.lc[i], 12), g_lt[t].r = u.lp[i][3], g_lt[t].glow = i >= n_zone;
             if (k < 0)
                 continue;
+            {
+                double dx = wp[0] - g_lt[k].p[0], dy = wp[1] - g_lt[k].p[1], dz = wp[2] - g_lt[k].p[2];
+                g_lt_move = fmax(g_lt_move, sqrt(dx * dx + dy * dy + dz * dz));
+            }
             /* place and colour settle slowly (a glow's middle wobbles with its billboard) */
             for (int j = 0; j < 3; ++j)
                 g_lt[k].p[j] += (wp[j] - g_lt[k].p[j]) * 0.1, g_lt[k].c[j] += (u.lc[i][j] - g_lt[k].c[j]) * 0.1f;
             g_lt[k].r += (u.lp[i][3] - g_lt[k].r) * 0.1f;
             g_lt[k].seen = g_serial;
+            if (i < n_zone)
+                g_lt[k].glow = 0; /* the game's own light there */
+            if (g_lt[k].hit_serial != g_serial)
+                g_lt[k].hit_serial = g_serial, g_lt[k].hits++;
         }
         float far = g_fxs.rt_point_far > 0.0f ? g_fxs.rt_point_far : 60.0f, key[RT_LKEEP];
         int idx[RT_LKEEP], m = 0;
@@ -4863,10 +4880,17 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         {
             if (!g_lt[t].live)
                 continue;
-            int on = g_lt[t].seen + 120 >= g_serial;
+            /* a glow's light: only once seen in 30 frames at its place (a lamp's; not a spark's, a spell's) */
+            int ready = !g_lt[t].glow || g_lt[t].hits >= 30;
+            if (!ready && g_lt[t].seen + 10 < g_serial)
+            {
+                g_lt[t].live = 0;
+                continue;
+            }
+            int on = ready && g_lt[t].seen + 120 >= g_serial;
             if (g_lt[t].fade_serial != g_serial)
                 g_lt[t].fade_serial = g_serial, g_lt[t].fade = fminf(fmaxf(g_lt[t].fade + (on ? 0.07f : -0.017f), 0.0f), 1.0f);
-            if (!on && g_lt[t].fade <= 0.0f)
+            if (!on && ready && g_lt[t].fade <= 0.0f)
             {
                 g_lt[t].live = 0;
                 continue;
@@ -4908,6 +4932,12 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         }
         u.pl[0] = (float)n, u.pl[1] = g_fxs.rt_point;
         g_pl_shown = n;
+        {
+            uint32_t live = 0;
+            for (int t = 0; t < RT_LKEEP; ++t)
+                live += g_lt[t].live;
+            g_lt_srcs[0] = live;
+        }
     }
     if (!g_sm.ccopy || g_sm.ccopy.width != ct.width || g_sm.ccopy.height != ct.height || g_sm.ccopy.pixelFormat != ct.pixelFormat)
     {
@@ -6355,11 +6385,12 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
                         "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
-                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; point lights %u (zone%s); terrain:%s\n", g_rtx.dr_exact,
+                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; point lights %u (kept %u, new %u [game %u zone %u glow %u], moved at most %.2f; zone%s); terrain:%s\n", g_rtx.dr_exact,
                         g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
                         g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel, g_sm.chk[0][1], g_sm.chk[0][0] + g_sm.chk[0][1],
-                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_pl_shown, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0, g_sm.skipped_sky = 0,
+                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_pl_shown, g_lt_srcs[0], g_lt_new, g_lt_newsrc[0], g_lt_newsrc[1], g_lt_newsrc[2], g_lt_move, g_zl.note, g_sm.vx_note), g_zl.note[0] = 0,
+                    g_lt_new = 0, g_lt_move = 0, memset(g_lt_newsrc, 0, sizeof g_lt_newsrc), g_sm.skipped_sky = 0,
                     memset(g_sm.chk, 0, sizeof g_sm.chk), g_sm.chk_note[0] = 0, g_sm.vx_note[0] = 0,
                     g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)
