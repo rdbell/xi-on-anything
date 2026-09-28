@@ -281,6 +281,9 @@ void gfx_world_final(void);
 /* Whether a world object at pos (the game's world), within radius of it, can cast the sun's shadow into
  * the view: inside the volume the middle shadow cascade covers (the last one drawn). 0 when unknown. */
 int gfx_rt_casts_into_view(const float pos[3], float radius);
+/* A point or spot light the game lit a draw with: world position, diffuse colour, range (the back end's
+ * lights in the world, gathered each frame). */
+void gfx_note_light(const float pos[3], const float diffuse[4], float range);
 /* One scene-effect setting by its key in the settings file (fx, ao, fog, bloom, rays, ...). */
 void gfx_fx_set(const char* key, float v);
 /* Its value now (the settings file reloads while the game runs); 0 for a key it does not know. */

@@ -131,6 +131,7 @@ void gfx_present(GfxTex* backbuffer)
 }
 void gfx_scene_done(GfxTex* color, const GfxScene* s) { (void)color, (void)s; }
 void gfx_world_final(void) {}
+void gfx_note_light(const float pos[3], const float diffuse[4], float range) { (void)pos, (void)diffuse, (void)range; }
 int gfx_rt_casts_into_view(const float pos[3], float radius) { (void)pos, (void)radius; return 0; }
 void gfx_fx_set(const char* key, float v) { (void)key, (void)v; }
 float gfx_fx_get(const char* key) { return (void)key, 0.0f; }

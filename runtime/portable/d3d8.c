@@ -2367,6 +2367,8 @@ static int build_draw(GfxDraw* d)
             gl->att[0] = v[21], gl->att[1] = v[22], gl->att[2] = v[23];
             gl->spot[0] = cosf(v[24] * 0.5f), gl->spot[1] = cosf(v[25] * 0.5f);
             d->vs.light_type[n++] = (uint8_t)type;
+            if (type != 3 && v[19] > 0.0f)
+                gfx_note_light(&v[13], &v[1], v[19]);
         }
         d->vs.nlights = (uint8_t)n;
     }
