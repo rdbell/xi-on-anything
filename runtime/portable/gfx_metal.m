@@ -143,7 +143,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -2467,6 +2467,8 @@ static const struct
     { "rt_point_far", offsetof(__typeof__(g_fxs), rt_point_far), 60.0f },
     { "rt_point_max", offsetof(__typeof__(g_fxs), rt_point_max), 48.0f },
     { "rt_point_sat", offsetof(__typeof__(g_fxs), rt_point_sat), 0.35f },
+    { "rt_sun_min", offsetof(__typeof__(g_fxs), rt_sun_min), 20.0f },
+    { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -5022,7 +5024,8 @@ static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger d
     memcpy(g_sm.cam, cam, sizeof cam);
     {
         char w[96];
-        snprintf(w, sizeof w, "maps at %.3f %.3f %.3f", cam[0], cam[1], cam[2]);
+        snprintf(w, sizeof w, "maps at %.3f %.3f %.3f casters %u late %u", cam[0], cam[1], cam[2], g_ncasters,
+            g_late_serial == g_serial ? g_nlate : 0);
         rt_cam_log(w);
     }
     double L[3] = { g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2] };
@@ -6275,11 +6278,20 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                     clock_gettime(CLOCK_REALTIME, &ts);
                     double t = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
                     double h = fmod((t - 1009810800.0) * 25.0 / 3600.0, 24.0);
+                    if (g_fxs.rt_hour >= 0.0f) /* the tester's hour */
+                        h = fmod(g_fxs.rt_hour, 24.0);
                     int night = h < 6.0 || h >= 18.0;
                     double a = fmod(h - (night ? 18.0 : 6.0) + 24.0, 24.0) / 12.0 * M_PI;
-                    u.sunw[0] = (float)cos(a), u.sunw[1] = (float)-sin(a), u.sunw[2] = 0.0f, u.sunw[3] = 1.0f;
-                    float up = (float)sin(a);
-                    strength *= (night ? g_fxs.rt_moon : 1.0f) * fminf(fmaxf((up - 0.03f) / 0.12f, 0.0f), 1.0f);
+                    /* in steps of a quarter degree (one every 2.4 s): the maps hold still between them */
+                    a = floor(a / (0.25 * M_PI / 180.0) + 0.5) * (0.25 * M_PI / 180.0);
+                    /* its height for the shadows at least rt_sun_min degrees: one near the horizon makes shadows
+                     * endless and skims every face, their edges crawling as the camera moves; they fade out
+                     * instead as it nears the horizon */
+                    double lo = fmax(g_fxs.rt_sun_min, 0.0) * M_PI / 180.0, el = a <= M_PI / 2 ? a : M_PI - a;
+                    double e = fmax(el, lo), az = a <= M_PI / 2 ? 0.0 : M_PI;
+                    u.sunw[0] = (float)(cos(e) * cos(az)), u.sunw[1] = (float)-sin(e), u.sunw[2] = 0.0f, u.sunw[3] = 1.0f;
+                    float fade = fminf(fmaxf((float)(el / (8.0 * M_PI / 180.0)), 0.0f), 1.0f);
+                    strength *= (night ? g_fxs.rt_moon : 1.0f) * fade * fade * (3.0f - 2.0f * fade);
                     g_rtx.game_hour = (float)h;
                 }
                 memcpy(g_rtx.sun_now, u.sunw, 16);

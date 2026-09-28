@@ -2842,6 +2842,9 @@ static struct
     int world_done; /* the effects ran on it this frame: once a frame */
     int final_done; /* gfx_world_final this frame */
     uint32_t after_final, st_after_final, st_after_frames, st_after_max, st_final_present; /* the check */
+    char after_note[160];
+    uint32_t world_after; /* the world's own draws after the lighting this frame */
+    uint32_t late_world;  /* frames left to light the world at its end rather than at its effects */
     struct { GfxTex* t; uint32_t n; } tally[4]; /* this frame's 3D draws per target */
     uint32_t draws; /* 3D draws to it since the effects last ran */
     int done, cam;  /* the effects ran this frame; s holds a camera */
@@ -2912,18 +2915,31 @@ static void scene_note(GfxDraw* d)
     if (!c)
         return;
     int large = (uint64_t)rt->width * rt->height * 2 >= (uint64_t)g_dev.pp[0] * g_dev.pp[1];
-    if (g_scene.final_done && c == g_scene.rt && !d->vs.rhw && d->depth.zenable)
+    if (g_scene.final_done && !d->vs.rhw)
+    {
         g_scene.after_final++;
+        if (!g_scene.after_note[0])
+            snprintf(g_scene.after_note, sizeof g_scene.after_note, "same target %d, zenable %d, zwrite %d, blend %d, vs %08x, prims %u",
+                c == g_scene.rt, d->depth.zenable, d->depth.zwrite, d->pipe.blend, d->vs.prog, d->count);
+    }
     /* the world sampled for the screen - complete, whatever came after its effects - or the interface
      * (nameplates, text) drawn onto it: the back end's lighting of the world goes under that */
+    /* ... or, unless the world's own draws went on after its effects lately (the title's flythrough), at
+     * the effects' first draw (blended, no depth written, unfogged): they always go over the lighting,
+     * never sometimes under it as the interface's first draw comes before or after them */
+    int effect = !d->vs.rhw && c == g_scene.rt && d->depth.zenable && !d->depth.zwrite && d->pipe.blend && !d->fs.fog &&
+        !d->vs.fog_vertex;
     if (g_scene.world_done && !g_scene.final_done)
     {
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
-        if ((sampled && large) || (d->vs.rhw && c == g_scene.rt))
+        if ((sampled && large) || (d->vs.rhw && c == g_scene.rt) || (effect && !g_scene.late_world))
             g_scene.final_done = 1, gfx_world_final();
     }
+    /* the world's own draws after it (the zone's shaders or fogged): lit wrongly - a later trigger for a while */
+    if (g_scene.final_done && !d->vs.rhw && c == g_scene.rt && d->depth.zenable && (d->vs.prog || d->fs.fog || d->vs.fog_vertex))
+        g_scene.world_after++;
     if (g_scene.draws && !g_scene.done)
     {
         int sampled = 0;
@@ -3069,6 +3085,11 @@ static void scene_present(void)
         g_scene.st_after_max = g_scene.after_final;
     g_scene.after_final = 0;
     g_scene.final_done = 0;
+    if (g_scene.world_after > 20)
+        g_scene.late_world = 300;
+    else if (g_scene.late_world)
+        g_scene.late_world--;
+    g_scene.world_after = 0;
     GfxTex* world_before = g_scene.world;
     /* next frame's world: this frame's busiest target */
     uint32_t best = 0;
@@ -3086,8 +3107,9 @@ static void scene_present(void)
             g_scene.rt == g_scene.world ? "the world's view" : "another target", g_scene.st_why[0], g_scene.st_why[1], g_scene.st_why[2],
             g_scene.st_why[3], g_scene.st_cam[2], g_scene.st_cam[1], g_scene.st_cam[0],
             g_scene.st_late, g_scene.st_over, g_scene.st_over_rhw);
-        fprintf(stderr, "[recomp] d3d8: world final: at present %u; world drawn after it in %u frames, %u draws, at most %u\n",
-            g_scene.st_final_present, g_scene.st_after_frames, g_scene.st_after_final, g_scene.st_after_max);
+        fprintf(stderr, "[recomp] d3d8: world final: at present %u; 3D drawn after it in %u frames, %u draws, at most %u (%s)\n",
+            g_scene.st_final_present, g_scene.st_after_frames, g_scene.st_after_final, g_scene.st_after_max, g_scene.after_note);
+        g_scene.after_note[0] = 0;
         g_scene.st_final_present = g_scene.st_after_frames = g_scene.st_after_final = g_scene.st_after_max = 0;
         memset(g_scene.st_why, 0, sizeof g_scene.st_why), memset(g_scene.st_cam, 0, sizeof g_scene.st_cam);
         g_scene.st_frames = g_scene.st_late = g_scene.st_over = g_scene.st_over_rhw = 0;

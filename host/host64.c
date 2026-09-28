@@ -412,6 +412,8 @@ static void setup_lod(void)
 extern GuestFn rt_hook_cull_test;
 #endif
 static uint32_t g_cull_inside; /* the matrix: x, y, z 0 and w 1 for every point */
+static uint32_t g_cull_frame;  /* frames, for how long an object stays kept */
+static struct { uint32_t obj, frame; } g_cull_keep[4096];
 
 static float rdf(uint32_t a)
 {
@@ -436,6 +438,23 @@ static void cull_test(Guest* g)
     uint32_t map = g->ecx, m = rd32(g->esp + 4), box = rd32(g->esp + 8);
     if (m != map + 0x38edc && m != map + 0x38fdc)
         return;
+    /* the objects with a draw distance of their own ([map+0x39428] times theirs, squared, tested before
+     * this): cull_far times as far (4 when not set) - one coming and going as the camera moves took its
+     * shadow with it. The game's value is kept apart, ours written over it each frame. */
+    {
+        static uint32_t game_map, game_mul, ours;
+        uint32_t now = rd32(map + 0x39428);
+        if (map != game_map || now != ours)
+            game_map = map, game_mul = now;
+        float gm, k = gfx_fx_get("cull_far"), v;
+        memcpy(&gm, &game_mul, 4);
+        if (k <= 0.0f)
+            k = 4.0f;
+        v = gm * k * k; /* (it multiplies a squared distance) */
+        memcpy(&ours, &v, 4);
+        if (gm > 0.0f && now != ours)
+            wr32(map + 0x39428, ours);
+    }
     float near = gfx_fx_get("cull_near");
     if (near <= 0.0f)
         near = 60.0f;
@@ -444,7 +463,23 @@ static void cull_test(Guest* g)
           dz = rdf(obj + 0x24) - rdf(map + 0x390f8);
     float pos[3] = { rdf(obj + 0x1c), rdf(obj + 0x20), rdf(obj + 0x24) };
     float rad = gfx_fx_get("cull_shadow");
-    if (dx * dx + dy * dy + dz * dz < near * near || gfx_rt_casts_into_view(pos, rad > 0.0f ? rad : 40.0f))
+    /* kept for two seconds after it last qualified: one on the edge would come and go every frame,
+     * its shadow with it */
+    uint32_t h = (obj >> 2) * 2654435761u >> (32 - 12);
+    int keep = dx * dx + dy * dy + dz * dz < near * near || gfx_rt_casts_into_view(pos, rad > 0.0f ? rad : 40.0f);
+    for (int probe = 0; probe < 8; ++probe)
+    {
+        uint32_t k = (h + probe) & 4095;
+        if (g_cull_keep[k].obj == obj || !g_cull_keep[k].obj || g_cull_keep[k].frame + 120 < g_cull_frame)
+        {
+            if (keep)
+                g_cull_keep[k].obj = obj, g_cull_keep[k].frame = g_cull_frame;
+            else if (g_cull_keep[k].obj == obj && g_cull_keep[k].frame + 120 >= g_cull_frame)
+                keep = 1;
+            break;
+        }
+    }
+    if (keep)
         wr32(g->esp + 4, g_cull_inside);
 }
 
@@ -508,6 +543,7 @@ static void present_hook(void)
     fix_aspect();
     fix_draw_distance();
     lod_frame();
+    g_cull_frame++;
     modern_frame();
     if (!g_fps_global)
         find_fps_global();
