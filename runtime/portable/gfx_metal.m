@@ -122,6 +122,8 @@ static uint32_t g_cmd_draws;          /* draws in the command buffer being recor
 static _Atomic uint64_t g_gpu_ns;      /* GPU time of the committed command buffers (profile) */
 
 static GfxTex* g_rt;
+/* the target the fog pass last put its fog into: the world's draws there are drawn clear (vfog) */
+static const GfxTex* g_vfog_target;
 static uint32_t g_rt_face, g_rt_level;
 static GfxTex* g_ds;
 static uint32_t g_pending_clear; /* D3DCLEAR flags for the next pass's load actions */
@@ -1211,7 +1213,8 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     if (rt_draw_wanted(d))
         k.lib.vs.rt = k.lib.fs.rt = 1;
     /* the volumetric fog (vfog): the world drawn clear, its fog put in after it (rt_defer_pass) */
-    if (g_fxs.vfog != 0.0f && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && (d->caster || d->receive) && !d->vs.rhw)
+    if (g_fxs.vfog != 0.0f && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && (d->caster || d->receive) && !d->vs.rhw &&
+        g_rt == g_vfog_target) /* (the world's own target: what goes elsewhere - a shot faded in - keeps its fog) */
         k.lib.fs.fog = 0;
     id<MTLRenderPipelineState> p = pipeline_for(&k, d->vs_tokens, d->ps_tokens);
     if (!p && k.lib.vs.rt)
@@ -1252,6 +1255,7 @@ typedef struct Caster
     uint8_t has_cw;
     int32_t zbias;
     float cw[16]; /* a fixed-function draw's clip space back to the world, its own view and projection's */
+    uint8_t ztest; /* drawn with a real depth test (not the sky's: off, or always passing) */
 } Caster;
 
 /* the zone's fog as its shaders make it (c9.x, c9.z, c5.x, c10.x) and the frame it was seen in (rt_defer) */
@@ -1297,6 +1301,7 @@ static Caster* late_new(const GfxDraw* d)
     c->lib.vs = d->vs, c->lib.fs = d->fs;
     c->vs = d->vs_tokens, c->ps = d->ps_tokens;
     c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
+    c->ztest = d->depth.zenable && d->depth.zfunc != 8;
     return c;
 }
 
@@ -1328,6 +1333,7 @@ static Caster* caster_new(const GfxDraw* d)
     c->vs = d->vs_tokens, c->ps = d->ps_tokens;
     c->zbias = d->zbias;
     c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
+    c->ztest = d->depth.zenable && d->depth.zfunc != 8;
     return c;
 }
 
@@ -2333,7 +2339,7 @@ static const struct
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
     { "vfog_height", offsetof(__typeof__(g_fxs), vfog_height), 0.02f },
-    { "vfog_sun", offsetof(__typeof__(g_fxs), vfog_sun), 1.0f },
+    { "vfog_sun", offsetof(__typeof__(g_fxs), vfog_sun), 0.3f },
     { "vfog_ambient", offsetof(__typeof__(g_fxs), vfog_ambient), 1.0f },
     { "vfog_g", offsetof(__typeof__(g_fxs), vfog_g), 0.6f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
@@ -3924,6 +3930,7 @@ static struct
     uint32_t chk[2][2];    /* the check: vs / fixed-function casters' origins off / on the far map */
     char chk_note[160];
     char vx_note[512];
+    uint32_t skipped_sky;
     SmCascade c[RT_CASCADES];
     int nc;                /* the cascades of the last maps */
     double cam[3]; /* the camera the maps' matrices are relative to (their scene's) */
@@ -4087,6 +4094,35 @@ static void rt_map_casters(uint32_t layer, const SmCascade* k, const double* rel
         const Caster* cs = i < g_ncasters ? &g_casters[i] : &g_late[i - g_ncasters];
         if (g_fxs.rt_only_vs != 0.0f && cs->has_cw) /* the check: zone shaders alone */
             continue;
+        /* not the sky: drawn without a real depth test, or centred on the camera (a dome that follows it) */
+        if (!cs->ztest)
+            continue;
+        if (cs->ub)
+        {
+            const GfxU* cu = (const GfxU*)((const uint8_t*)[cs->ub contents] + cs->uoff);
+            float c[4];
+            for (int r = 0; r < 4; ++r)
+                c[r] = cs->lib.vs.prog ? cu->vsc[r][3] : cu->wvp[12 + r];
+            const float* inv = cs->has_cw ? cs->cw : NULL;
+            double o[4] = { 0, 0, 0, 0 };
+            for (int j = 0; j < 4; ++j)
+                o[j] = inv ? c[0] * inv[j] + c[1] * inv[4 + j] + c[2] * inv[8 + j] + c[3] * inv[12 + j]
+                           : c[0] * rel[j] + c[1] * rel[4 + j] + c[2] * rel[8 + j] + c[3] * rel[12 + j];
+            if (fabs(o[3]) > 1e-9)
+            {
+                double x = o[0] / o[3], y = o[1] / o[3], z = o[2] / o[3];
+                /* fixed function: back in the world, less the camera's place - or already so, a view with
+                 * the camera's place left out (the sky's) */
+                int sky = inv && x * x + y * y + z * z < 4.0;
+                if (inv)
+                    x -= cam[0], y -= cam[1], z -= cam[2];
+                if (sky || x * x + y * y + z * z < 4.0)
+                {
+                    g_sm.skipped_sky += layer == 0;
+                    continue;
+                }
+            }
+        }
         if (cs->has_cw) /* fixed function: its own view back to the world */
         {
             double cw[16], m2[16];
@@ -4229,7 +4265,7 @@ static const char DS_MSL[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
-    "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; };\n"
+    "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; float4 fwd; };\n"
     "struct DO { float4 pos [[position]]; };\n"
     "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
     "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
@@ -4282,7 +4318,7 @@ static const char DS_MSL[] =
     "static float3 ds_vfog(constant DS& d, depth2d_array<float> sm, float3 p, float dist, thread float& T) {\n"
     "  constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
     "  T = 1.0;\n"
-    "  float t0 = min(d.vf.y, dist), seg = (dist - t0) / 24.0;\n"
+    "  float t0 = d.vf.x > 0.0 ? min(d.vf.y, dist) : 0.0, seg = (dist - t0) / 24.0;\n"
     "  if (seg <= 0.0) return float3(0.0);\n"
     "  float3 dir = p / max(dist, 1e-3);\n"
     "  float g = d.vf.w, mu = dot(dir, d.sun.xyz);\n"
@@ -4300,9 +4336,13 @@ static const char DS_MSL[] =
     "        lit = sm.sample_compare(cmp, float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5), uint(c), q.z - d.cs[c].z);\n"
     "    }\n"
     "    float3 L = d.fogc.rgb * d.vf2.x + d.sunc.rgb * d.vf2.y * ph * lit;\n"
-    "    float e = exp(-rho * seg);\n"
-    "    acc += T * (1.0 - e) * L;\n"
-    "    T *= e;\n"
+    "    float Tn;\n"
+    "    if (d.vf.x > 0.0) Tn = T * exp(-rho * seg);\n"
+    /* the game's own fog: what is left of a surface at the view's depth there, clamped as it clamps */
+    "    else { float w = (t + 0.5 * seg) * max(dot(dir, d.fwd.xyz), 0.05);\n"
+    "           Tn = min(T, clamp((d.fog.y - w) * d.fog.x, d.fog.z, d.fog.w)); }\n"
+    "    acc += (T - Tn) * L;\n"
+    "    T = Tn;\n"
     "  }\n"
     "  return acc;\n"
     "}\n"
@@ -4354,7 +4394,7 @@ static const char DS_MSL[] =
     "  float z, zx0, zx1, zy0, zy1;\n"
     "  float3 p = ds_at(d, dep, px, z);\n"
     "  if (z >= 1.0) {\n"
-    "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
+    "    if (d.vf2.w <= 0.0 || d.k.z > 0.0 || d.vf.x <= 0.0) return col;\n"
     "    float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, d.vf2.z);\n"
     "    return float4(col.rgb * fo.a + fo.rgb, col.a);\n"
     "  }\n"
@@ -4368,6 +4408,12 @@ static const char DS_MSL[] =
     "  n = nn > 1e-20 ? n * rsqrt(nn) : float3(0.0, -1.0, 0.0);\n"
     "  if (dot(n, p) > 0.0) n = -n;\n"
     "  float dist = length(p);\n"
+    /* rt_debug 9: the place rebuilt (a 2-unit grid on x/z, height in blue); 10: the far map's depth there
+     * against the place's own (red: the map nearer the sun) */
+    "  if (d.k.z > 8.5 && d.k.z < 9.5) { float2 g = fract(p.xz / 2.0); return float4(g.x < 0.1 || g.y < 0.1 ? 1.0 : 0.2, 0.2, fract(p.y / 5.0), 1.0); }\n"
+    "  if (d.k.z > 9.5) { float4 q = d.s[2] * float4(p, 1.0); float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);\n"
+    "    float m = sm.read(uint2(clamp(uv, 0.0, 0.999) * float2(sm.get_width(), sm.get_height())), 2u);\n"
+    "    return float4(saturate((q.z - m) * 200.0), saturate((m - q.z) * 200.0), q.z > 1.0 || q.z < 0.0 ? 1.0 : 0.0, 1.0); }\n"
     "  if (dist >= d.k.y) {\n"
     "    if (d.vf2.w <= 0.0 || d.k.z > 0.0) return col;\n"
     "    float4 fo = ds_fog_at(d, ft, fd, in.pos.xy, dist);\n"
@@ -4386,7 +4432,7 @@ static const char DS_MSL[] =
     "  float a = d.k.x * (1.0 - v) * (1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist));\n"
     /* the fog's share: w (the view's depth) from the depth, then the zone shaders' own fog */
     "  float f = 1.0;\n"
-    "  if (d.fog.w > 0.0) {\n"
+    "  if (d.fog.w > 0.0 && d.vf2.w <= 0.0) {\n"
     "    float zn = (z - d.pz.z) / max(d.pz.w - d.pz.z, 1e-6);\n"
     "    float w = d.pz.y / (zn - d.pz.x);\n"
     "    f = saturate(clamp((d.fog.y - abs(w)) * d.fog.x, d.fog.z, d.fog.w));\n"
@@ -4422,6 +4468,7 @@ typedef struct DsU
     float vf[4];    /* the volumetric fog: density a unit, where it starts, its fall with height a unit, the sun's lobe g */
     float vf2[4];   /* its ambient light, its sunlight, how far a ray of the sky goes, on (0: none) */
     float sunc[4];  /* the sun's colour */
+    float fwd[4];   /* the camera's forward (the view's depth along a ray: the game's fog goes by it) */
 } DsU;
 
 /* the pass into ct (its depth dep), for scene s */
@@ -4498,20 +4545,25 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     if (g_fxs.vfog != 0.0f)
     {
         /* its density from the game's fog when not given: most of the way gone where the game's ends */
+        /* the game's own fog curve (vfog_density 0) when its zone gave one, else a density of our own */
         float dens = g_fxs.vfog_density, start = 0.0f;
-        if (dens <= 0.0f)
-        {
+        int game = dens <= 0.0f && g_zfog_serial + 2 >= g_serial && g_zfog[0] > 0.0f && g_zfog[1] > 0.0f;
+        if (game)
+            dens = 0.0f;
+        else if (dens <= 0.0f)
             dens = 0.004f;
-            if (g_zfog_serial + 2 >= g_serial && g_zfog[0] > 0.0f && g_zfog[1] > 0.0f)
-            {
-                float end = g_zfog[1], len = 1.0f / g_zfog[0];
-                start = fmaxf(end - len, 0.0f);
-                dens = 3.5f / fmaxf(end - start, 1.0f);
-            }
-        }
         u.vf[0] = dens, u.vf[1] = start, u.vf[2] = g_fxs.vfog_height, u.vf[3] = fminf(fmaxf(g_fxs.vfog_g, -0.9f), 0.9f);
         u.vf2[0] = g_fxs.vfog_ambient, u.vf2[1] = g_fxs.vfog_sun, u.vf2[2] = 800.0f, u.vf2[3] = 1.0f;
-        memset(u.fog, 0, sizeof u.fog); /* the world drawn clear: no fog's share in its colour */
+        if (game)
+            memcpy(u.fog, g_zfog, 16), u.fog[2] = fmaxf(u.fog[2], 0.0f), u.fog[3] = fminf(fmaxf(u.fog[3], u.fog[2]), 1.0f);
+        {
+            float c[4] = { 0, 0, 0.5f, 1 }, w[4];
+            for (int j = 0; j < 4; ++j)
+                w[j] = c[0] * g_sm.rel[j] + c[1] * g_sm.rel[4 + j] + c[2] * g_sm.rel[8 + j] + c[3] * g_sm.rel[12 + j];
+            float l = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * (w[3] < 0 ? -1.0f : 1.0f);
+            if (fabsf(l) > 1e-6f)
+                u.fwd[0] = w[0] / l, u.fwd[1] = w[1] / l, u.fwd[2] = w[2] / l;
+        }
         float sc[3] = { s->sun_color[0], s->sun_color[1], s->sun_color[2] };
         if (sc[0] + sc[1] + sc[2] < 0.05f)
             sc[0] = 1.0f, sc[1] = 0.93f, sc[2] = 0.8f;
@@ -5604,6 +5656,18 @@ static struct
     uint64_t serial;
 } g_wf;
 
+int gfx_rt_casts_into_view(const float pos[3], float radius)
+{
+    if (!g_sm.ok || g_sm.nc < 2)
+        return 0;
+    const SmCascade* k = &g_sm.c[1];
+    double p[3] = { pos[0] - g_sm.cam[0], pos[1] - g_sm.cam[1], pos[2] - g_sm.cam[2] }, q[4];
+    for (int j = 0; j < 4; ++j)
+        q[j] = p[0] * k->m[j] + p[1] * k->m[4 + j] + p[2] * k->m[8 + j] + k->m[12 + j];
+    double half = k->texel * RT_MAP * 0.5, mx = radius / half, mz = radius / k->range;
+    return fabs(q[0]) < 1.0 + mx && fabs(q[1]) < 1.0 + mx && q[2] > -mz && q[2] < 1.0 + mz;
+}
+
 static void scene_done_impl(GfxTex* color, const GfxScene* s);
 static uint32_t g_late_last; /* world draws after the effects in the last frame completed (gfx_world_final) */
 static struct
@@ -5644,7 +5708,9 @@ void gfx_world_final(void)
         id<MTLTexture> depth = color->depth_world ? color->depth_world : color->depth_seen;
         rt_frame(g_wf.cw, g_wf.vinv, s->view, s->proj, s->cam != 0);
         if (rt_inpass() && depth && depth.width == color->tex.width && depth.height == color->tex.height)
-            rt_defer_pass(color->tex, depth, s, g_wf.vp);
+            rt_defer_pass(color->tex, depth, s, g_wf.vp), g_vfog_target = color;
+        else
+            g_vfog_target = NULL;
     }
 }
 
@@ -5928,11 +5994,11 @@ static void scene_done_impl(GfxTex* color, const GfxScene* s)
                 if (rt_inpass())
                     fprintf(stderr, "[recomp] gfx: rt: shaded draws: %u with the frame's camera from an anchor, %u with the "
                         "last frame's, %u fixed-function, %u with none; frames from a solo place %u (%u held); sun %.2f %.2f %.2f %s, strength %.2f; maps %s: %u "
-                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); terrain:%s\n", g_rtx.dr_exact,
+                        "instances, %u draws, texels %.3f / %.3f / %.3f units; origins on the far map: vs %u of %u, ffp %u of %u (%s); sky skipped %u; terrain:%s\n", g_rtx.dr_exact,
                         g_rtx.dr_pred, g_rtx.dr_ffp, g_rtx.dr_none, g_rtx.dr_solo, g_rtx.dr_solo_far, g_rtx.sun_now[0], g_rtx.sun_now[1], g_rtx.sun_now[2],
                         g_rtx.sun_now[3] > 0.0f ? "on" : "off", g_rtx.k_now[0], g_sm.ok ? "on" : "off", g_sm.instances,
                         g_sm.drawn, g_sm.c[0].texel, g_sm.c[1].texel, g_sm.c[2].texel, g_sm.chk[0][1], g_sm.chk[0][0] + g_sm.chk[0][1],
-                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.vx_note),
+                        g_sm.chk[1][1], g_sm.chk[1][0] + g_sm.chk[1][1], g_sm.chk_note, g_sm.skipped_sky, g_sm.vx_note), g_sm.skipped_sky = 0,
                     memset(g_sm.chk, 0, sizeof g_sm.chk), g_sm.chk_note[0] = 0, g_sm.vx_note[0] = 0,
                     g_rtx.dr_exact = g_rtx.dr_pred = g_rtx.dr_ffp = g_rtx.dr_none = g_rtx.dr_solo = g_rtx.dr_solo_far = 0;
                 if (g_fxs.rt > 0.0f && g_rtx.ok)

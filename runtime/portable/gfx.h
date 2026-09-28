@@ -278,6 +278,9 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s);
  * may have run before the last of it was drawn (FFXI draws some of the world after an effect-like
  * layer); what needs all of it - the sun's shadow - is done here, once a frame. */
 void gfx_world_final(void);
+/* Whether a world object at pos (the game's world), within radius of it, can cast the sun's shadow into
+ * the view: inside the volume the middle shadow cascade covers (the last one drawn). 0 when unknown. */
+int gfx_rt_casts_into_view(const float pos[3], float radius);
 /* One scene-effect setting by its key in the settings file (fx, ao, fog, bloom, rays, ...). */
 void gfx_fx_set(const char* key, float v);
 /* Its value now (the settings file reloads while the game runs); 0 for a key it does not know. */

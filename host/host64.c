@@ -442,7 +442,9 @@ static void cull_test(Guest* g)
     uint32_t obj = box - 0xf4;
     float dx = rdf(obj + 0x1c) - rdf(map + 0x390f0), dy = rdf(obj + 0x20) - rdf(map + 0x390f4),
           dz = rdf(obj + 0x24) - rdf(map + 0x390f8);
-    if (dx * dx + dy * dy + dz * dz < near * near)
+    float pos[3] = { rdf(obj + 0x1c), rdf(obj + 0x20), rdf(obj + 0x24) };
+    float rad = gfx_fx_get("cull_shadow");
+    if (dx * dx + dy * dy + dz * dz < near * near || gfx_rt_casts_into_view(pos, rad > 0.0f ? rad : 40.0f))
         wr32(g->esp + 4, g_cull_inside);
 }
 

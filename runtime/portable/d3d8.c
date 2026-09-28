@@ -2839,6 +2839,7 @@ static struct
     GfxTex* world;
     int world_done; /* the effects ran on it this frame: once a frame */
     int final_done; /* gfx_world_final this frame */
+    uint32_t after_final, st_after_final, st_after_frames, st_after_max, st_final_present; /* the check */
     struct { GfxTex* t; uint32_t n; } tally[4]; /* this frame's 3D draws per target */
     uint32_t draws; /* 3D draws to it since the effects last ran */
     int done, cam;  /* the effects ran this frame; s holds a camera */
@@ -2909,6 +2910,8 @@ static void scene_note(GfxDraw* d)
     if (!c)
         return;
     int large = (uint64_t)rt->width * rt->height * 2 >= (uint64_t)g_dev.pp[0] * g_dev.pp[1];
+    if (g_scene.final_done && c == g_scene.rt && !d->vs.rhw && d->depth.zenable)
+        g_scene.after_final++;
     /* the world sampled for the screen: complete, whatever came after its effects */
     if (g_scene.world_done && !g_scene.final_done && large)
     {
@@ -3057,7 +3060,11 @@ static void scene_present(void)
 {
     scene_finish("present");
     if (g_scene.world_done && !g_scene.final_done)
-        gfx_world_final();
+        gfx_world_final(), g_scene.st_final_present++;
+    g_scene.st_after_final += g_scene.after_final, g_scene.st_after_frames += g_scene.after_final > 0;
+    if (g_scene.after_final > g_scene.st_after_max)
+        g_scene.st_after_max = g_scene.after_final;
+    g_scene.after_final = 0;
     g_scene.final_done = 0;
     GfxTex* world_before = g_scene.world;
     /* next frame's world: this frame's busiest target */
@@ -3076,6 +3083,9 @@ static void scene_present(void)
             g_scene.rt == g_scene.world ? "the world's view" : "another target", g_scene.st_why[0], g_scene.st_why[1], g_scene.st_why[2],
             g_scene.st_why[3], g_scene.st_cam[2], g_scene.st_cam[1], g_scene.st_cam[0],
             g_scene.st_late, g_scene.st_over, g_scene.st_over_rhw);
+        fprintf(stderr, "[recomp] d3d8: world final: at present %u; world drawn after it in %u frames, %u draws, at most %u\n",
+            g_scene.st_final_present, g_scene.st_after_frames, g_scene.st_after_final, g_scene.st_after_max);
+        g_scene.st_final_present = g_scene.st_after_frames = g_scene.st_after_final = g_scene.st_after_max = 0;
         memset(g_scene.st_why, 0, sizeof g_scene.st_why), memset(g_scene.st_cam, 0, sizeof g_scene.st_cam);
         g_scene.st_frames = g_scene.st_late = g_scene.st_over = g_scene.st_over_rhw = 0;
     }
