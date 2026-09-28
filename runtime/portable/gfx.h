@@ -126,7 +126,9 @@ typedef struct GfxFsKey
                    * scene's triangles (buffer 6), before the fog */
     uint8_t overlay; /* 2D drawn onto the world before its lighting: its fragments mark stencil bit 0x80
                       * (the lighting leaves them be), the see-through ones discarded */
-    uint8_t pad[1];
+    uint8_t mrt;  /* the world's layers (the back end's, rt_mrt): 0 none; 1 solid (the image, and the see-through
+                   * layer reset where it lands); 2 see-through blended, 3 see-through replacing (the layer
+                   * only); 4 plain, in a pass that has the layer (the image alone) */
 } GfxFsKey;
 
 /* The render pipeline beyond the functions: blending and the color write mask. */
@@ -200,6 +202,7 @@ typedef struct GfxDraw
                      * world's drawn after the scene's effects ran (characters, some frames): traced
                      * with the next frame's scene (the back end's ray tracing), no shadow map */
     uint8_t overlay; /* 2D onto the world's target before the world is lit (nameplates, text) */
+    uint8_t mrt;     /* onto the world's target before it is lit: 1 solid, 2 see-through or 2D (rt_mrt) */
     uint8_t receive; /* the world's own (the zone's shaders, or fogged) in its scene, blended ones too -
                       * its decals: the sun's shadow falls on it */
     uint8_t fill;   /* D3DFILLMODE */

@@ -2925,7 +2925,7 @@ static void scene_finish(const char* why)
 
 static void scene_note(GfxDraw* d)
 {
-    d->caster = 0, d->receive = 0, d->overlay = 0;
+    d->caster = 0, d->receive = 0, d->overlay = 0, d->mrt = 0;
     uint32_t face, level;
     Obj* rt = obj(g_dev.rt);
     GfxTex* c = rt ? surface_gpu(rt, &face, &level) : NULL;
@@ -2939,8 +2939,14 @@ static void scene_note(GfxDraw* d)
             snprintf(g_scene.after_note, sizeof g_scene.after_note, "same target %d, zenable %d, zwrite %d, blend %d, vs %08x, prims %u",
                 c == g_scene.rt, d->depth.zenable, d->depth.zwrite, d->pipe.blend, d->vs.prog, d->count);
     }
+    /* the world's layers (rt_mrt): onto the world's target until it is lit - the solid into its image,
+     * see-through and 2D into the layer put over it once lit; the lighting then need not guess when the
+     * world is done, only runs where it is used */
+    int mrt_on = gfx_fx_get("rt_mrt") != 0.0f;
+    if (mrt_on && c == g_scene.world && !face && !level && large && !g_scene.final_done)
+        d->mrt = d->vs.rhw || (d->pipe.blend && !d->depth.zwrite) ? 2 : 1;
     /* the interface onto the world before it is lit: kept out of the lighting (the back end marks it) */
-    if (d->vs.rhw && c == g_scene.rt && !g_scene.final_done)
+    if (!mrt_on && d->vs.rhw && c == g_scene.rt && !g_scene.final_done)
         d->overlay = 1;
     /* the world sampled for the screen - complete, whatever came after its effects - or the interface
      * (nameplates, text) drawn onto it: the back end's lighting of the world goes under that */
@@ -2951,12 +2957,12 @@ static void scene_note(GfxDraw* d)
      * pieces, a door drawn over its alcove - which come in order of distance: lit, a piece among them would be
      * lit or not as it came before or after the first) */
     int effect = !d->vs.rhw && c == g_scene.rt && d->depth.zenable && !d->depth.zwrite && d->pipe.blend;
-    if (g_scene.world_done && !g_scene.final_done)
+    if ((g_scene.world_done || mrt_on) && !g_scene.final_done)
     {
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] && d->tex[i] == g_scene.rt;
-        if ((sampled && large) || (effect && !g_scene.late_world))
+        if ((sampled && large) || (effect && !g_scene.late_world && !mrt_on))
             g_scene.final_done = 1, gfx_world_final();
     }
     /* the world's own draws after it (the zone's shaders or fogged): lit wrongly - a later trigger for a while */
@@ -3102,7 +3108,7 @@ static void scene_trace(GfxTex* world_before)
 static void scene_present(void)
 {
     scene_finish("present");
-    if (g_scene.world_done && !g_scene.final_done)
+    if ((g_scene.world_done || gfx_fx_get("rt_mrt") != 0.0f) && !g_scene.final_done)
         gfx_world_final(), g_scene.st_final_present++;
     g_scene.st_after_final += g_scene.after_final, g_scene.st_after_frames += g_scene.after_final > 0;
     if (g_scene.after_final > g_scene.st_after_max)

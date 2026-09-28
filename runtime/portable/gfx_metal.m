@@ -122,6 +122,14 @@ static uint32_t g_cmd_draws;          /* draws in the command buffer being recor
 static _Atomic uint64_t g_gpu_ns;      /* GPU time of the committed command buffers (profile) */
 
 static GfxTex* g_rt;
+/* the world's layers (rt_mrt): its target, what see-through draws add (s) and what of the image shows through
+ * them (t), put together with the lit image once the world is complete (rt_world_composite) */
+static const GfxTex* g_ov_target;
+static id<MTLTexture> g_ov_s, g_ov_t;
+static int g_ov_pass;          /* the pass being encoded has them */
+static int g_ov_reset = 1;     /* cleared when next attached (s 0, t 1) */
+static uint64_t g_ov_serial;   /* the frame a draw last went into them */
+static uint64_t g_ov_done;     /* the frame they were last put over the image */
 /* the target the fog pass last put its fog into: the world's draws there are drawn clear (vfog) */
 static const GfxTex* g_vfog_target;
 static uint32_t g_rt_face, g_rt_level;
@@ -143,7 +151,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -857,6 +865,28 @@ static int begin_pass(void)
     }
     else
         p.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    g_ov_pass = 0;
+    if (g_fxs.rt_mrt != 0.0f && g_rt == g_ov_target && !g_rt_face && !g_rt_level)
+    {
+        NSUInteger w = g_rt->tex.width, h = g_rt->tex.height;
+        if (!g_ov_s || g_ov_s.width != w || g_ov_s.height != h)
+        {
+            [g_ov_s release], [g_ov_t release];
+            MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w
+                                                                                        height:h mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            g_ov_s = [g_dev newTextureWithDescriptor:td], g_ov_t = [g_dev newTextureWithDescriptor:td];
+            g_ov_reset = 1;
+        }
+        int clear = g_ov_reset || (g_pending_clear & 1);
+        p.colorAttachments[1].texture = g_ov_s, p.colorAttachments[2].texture = g_ov_t;
+        p.colorAttachments[1].storeAction = p.colorAttachments[2].storeAction = MTLStoreActionStore;
+        p.colorAttachments[1].loadAction = p.colorAttachments[2].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        p.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        p.colorAttachments[2].clearColor = MTLClearColorMake(1, 1, 1, 1);
+        g_ov_reset = 0, g_ov_pass = 1;
+    }
     id<MTLTexture> depth = depth_attachment();
     if (depth)
     {
@@ -1057,6 +1087,33 @@ static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_
             c.destinationRGBBlendFactor = c.destinationAlphaBlendFactor = blend_factor(df, k->x8);
             c.rgbBlendOperation = c.alphaBlendOperation = blend_op(k->pipe.op);
         }
+        if (k->lib.fs.mrt)
+        {
+            /* the world's layers: 1 solid (the image as it blends; the layers overwritten: s 0, t 1); 2 see-through
+             * blended (the image left; s blended as the image would be, t by the same factor on the image's
+             * side); 3 see-through replacing (s the colour, t 0); 4 the image alone */
+            int m = k->lib.fs.mrt;
+            uint32_t sf = k->pipe.src, df = k->pipe.dst;
+            if (sf == 12)
+                sf = 5, df = 6;
+            else if (sf == 13)
+                sf = 6, df = 5;
+            for (int a = 1; a <= 2; ++a)
+            {
+                MTLRenderPipelineColorAttachmentDescriptor* o = pd.colorAttachments[a];
+                o.pixelFormat = MTLPixelFormatRGBA16Float;
+                o.writeMask = m == 4 ? MTLColorWriteMaskNone : MTLColorWriteMaskAll;
+                if (m == 2)
+                {
+                    o.blendingEnabled = YES;
+                    o.sourceRGBBlendFactor = o.sourceAlphaBlendFactor = a == 1 ? blend_factor(sf, 0) : MTLBlendFactorZero;
+                    o.destinationRGBBlendFactor = o.destinationAlphaBlendFactor = blend_factor(df, 0);
+                    o.rgbBlendOperation = o.alphaBlendOperation = a == 1 ? blend_op(k->pipe.op) : MTLBlendOperationAdd;
+                }
+            }
+            if (m == 2 || m == 3)
+                c.writeMask = MTLColorWriteMaskNone;
+        }
         pd.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth;
         pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k->stencil;
         NSError* err = nil;
@@ -1214,7 +1271,9 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     if (rt_draw_wanted(d))
         k.lib.vs.rt = k.lib.fs.rt = 1;
     /* the interface onto the world before its lighting: marking the stencil (rt_defer) */
-    int ov = d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment();
+    if (g_ov_pass)
+        k.lib.fs.mrt = d->mrt == 1 ? 1 : d->mrt == 2 ? (d->pipe.blend ? 2 : 3) : 4;
+    int ov = !g_ov_pass && d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment();
     if (ov)
         k.lib.fs.overlay = 1;
     /* the volumetric fog (vfog): the world drawn clear, its fog put in after it (rt_defer_pass) */
@@ -1624,6 +1683,10 @@ void gfx_draw(const GfxDraw* d)
             memcpy(g_gl.p[g_gl.n], o, sizeof o), g_gl.clip[g_gl.n++] = (uint8_t)clip;
     }
     /* testing: the 3D alone - no screen-space draws but those of a rendered image (the scene's own) */
+    if (d->mrt && g_fxs.rt_mrt != 0.0f && !g_rt_face && !g_rt_level && g_rt && g_rt != g_ov_target)
+        end_pass(), g_ov_target = g_rt, g_ov_reset = 1; /* the world's layers go with this target now */
+    if (d->mrt && g_ov_target == g_rt)
+        g_ov_serial = g_serial;
     if (g_fxs.hide_ui != 0.0f && d->vs.rhw && !(d->tex[0] && d->tex[0]->use == GFX_USE_RT))
         return;
     uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
@@ -1657,7 +1720,7 @@ static void draw_encode(const GfxDraw* d)
         GfxDepthKey dk = d->depth;
         if (!depth_attachment())
             memset(&dk, 0, sizeof dk);
-        if (d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment() && !dk.stencil)
+        if (!g_ov_pass && d->overlay && g_fxs.rt_defer != 0.0f && g_fxs.rt > 0.0f && g_ds && g_ds->has_stencil && depth_attachment() && !dk.stencil)
         {
             /* the interface over the world, before it is lit: its pixels marked in stencil bit 0x80 */
             dk.stencil = 1, dk.sfunc = 8, dk.sfail = dk.szfail = 1, dk.spass = 3, dk.sread = 0, dk.swrite = 0x80;
@@ -2488,6 +2551,7 @@ static const struct
     { "rt_hour", offsetof(__typeof__(g_fxs), rt_hour), -1.0f },
     { "iface_end", offsetof(__typeof__(g_fxs), iface_end), 1.0f },
     { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 0.0f },
+    { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4562,10 +4626,8 @@ static const char DS_MSL[] =
     "    }\n"
     "  return ws > 1e-6 ? sum / ws : ft.read(uint2(clamp(b, int2(0), hi)));\n"
     "}\n"
-    "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
-    "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
-    "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
-    "                      texture2d<float> fd [[texture(5)]], texture2d<uint> st [[texture(6)]]) {\n"
+    "static float4 ds_lit(DO in, constant DS& d, depth2d<float> dep, depth2d_array<float> sm, texture2d<float> src,\n"
+    "                     texture2d<float> rsm, texture2d<float> ft, texture2d<float> fd, texture2d<uint> st) {\n"
     "  int2 px = int2(in.pos.xy);\n"
     "  float4 col = src.read(uint2(px));\n"
     /* the interface drawn onto the world before it was lit: left as it is */
@@ -4662,6 +4724,22 @@ static const char DS_MSL[] =
     "    }\n"
     "  }\n"
     "  return float4(oc, col.a);\n"
+    "}\n"
+    /* the lit image with the see-through layer over it (the world's layers, rt_mrt: pl.w) */
+    "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
+    "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
+    "                      texture2d<float> rsm [[texture(3)]], texture2d<float> ft [[texture(4)]],\n"
+    "                      texture2d<float> fd [[texture(5)]], texture2d<uint> st [[texture(6)]],\n"
+    "                      texture2d<float> ls [[texture(7)]], texture2d<float> lt [[texture(8)]]) {\n"
+    "  float4 c = ds_lit(in, d, dep, sm, src, rsm, ft, fd, st);\n"
+    "  if (d.pl.w > 0.0) { uint2 p = uint2(in.pos.xy); c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; }\n"
+    "  return c;\n"
+    "}\n"
+    /* the layers alone, over the image as it is (no lighting this frame) */
+    "fragment float4 ds_comp(DO in [[stage_in]], texture2d<float> src [[texture(2)]], texture2d<float> ls [[texture(7)]],\n"
+    "                        texture2d<float> lt [[texture(8)]]) {\n"
+    "  uint2 p = uint2(in.pos.xy); float4 c = src.read(p);\n"
+    "  c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; return c;\n"
     "}\n";
 
 /* the game's point lights this frame and the last (the pass lights with the last complete frame's) */
@@ -4730,15 +4808,15 @@ typedef struct DsU
 } DsU;
 
 /* the pass into ct (its depth dep), for scene s */
-static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* s, const float* vp)
+static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* s, const float* vp)
 {
     if (!g_sm.ok || !g_sm.map)
-        return;
+        return 0;
     static int dlib_tried;
     if (!g_sm.dlib && !dlib_tried)
         dlib_tried = 1, g_sm.dlib = compile(DS_MSL);
     if (!g_sm.dlib)
-        return;
+        return 0;
     if (!g_sm.dpipe || g_sm.dfmt != ct.pixelFormat)
     {
         [g_sm.dpipe release];
@@ -4765,7 +4843,7 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         }
         [vf release], [pd release];
         if (!g_sm.dpipe)
-            return;
+            return 0;
     }
     DsU u;
     memset(&u, 0, sizeof u);
@@ -5018,6 +5096,9 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     if (dep.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && (dep.usage & MTLTextureUsagePixelFormatView))
         sview = [dep newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
     u.pl[2] = sview ? 1.0f : 0.0f;
+    /* the world's layers over it, when the world went into them this frame */
+    int layers = g_ov_serial == g_serial && g_ov_target && g_ov_target->tex == ct && g_ov_s;
+    u.pl[3] = layers ? 1.0f : 0.0f;
     /* (too large to pass inline: in this frame's ring) */
     id<MTLBuffer> ub;
     NSUInteger uoff;
@@ -5066,6 +5147,8 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
     [e setFragmentTexture:g_sm.fogd atIndex:5];
     [e setFragmentTexture:g_sm.ccopy atIndex:2];
     [e setFragmentTexture:sview ? sview : g_sm.ccopy atIndex:6];
+    [e setFragmentTexture:layers ? g_ov_s : g_sm.ccopy atIndex:7];
+    [e setFragmentTexture:layers ? g_ov_t : g_sm.ccopy atIndex:8];
     [e setFragmentTexture:g_sm.rsm atIndex:3];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
@@ -5108,9 +5191,64 @@ static void rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene*
         }
         [sview release];
     }
+    if (layers)
+        g_ov_reset = 1, g_ov_done = g_serial;
+    return 1;
 }
 
 static void rt_cam_log(const char* what);
+
+/* the world's layers over its image as it is (the lighting did not run this frame) */
+static void rt_world_composite(void)
+{
+    if (g_ov_serial != g_serial || g_ov_done == g_serial || !g_ov_target || !g_ov_s)
+        return;
+    id<MTLTexture> ct = g_ov_target->tex;
+    if (!g_sm.dlib)
+        g_sm.dlib = compile(DS_MSL);
+    static id<MTLRenderPipelineState> cp;
+    static MTLPixelFormat cfmt;
+    if (!g_sm.dlib)
+        return;
+    if (!cp || cfmt != ct.pixelFormat)
+    {
+        [cp release];
+        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+        id<MTLFunction> vf = [g_sm.dlib newFunctionWithName:@"ds_vs"], ff = [g_sm.dlib newFunctionWithName:@"ds_comp"];
+        pd.vertexFunction = vf, pd.fragmentFunction = ff, pd.colorAttachments[0].pixelFormat = ct.pixelFormat;
+        NSError* err = nil;
+        cp = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        cfmt = ct.pixelFormat;
+        [vf release], [ff release], [pd release];
+        if (!cp)
+            return;
+    }
+    if (!g_sm.ccopy || g_sm.ccopy.width != ct.width || g_sm.ccopy.height != ct.height || g_sm.ccopy.pixelFormat != ct.pixelFormat)
+    {
+        [g_sm.ccopy release];
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ct.pixelFormat width:ct.width
+                                                                                     height:ct.height mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        g_sm.ccopy = [g_dev newTextureWithDescriptor:td];
+    }
+    id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+    [b copyFromTexture:ct sourceSlice:0 sourceLevel:0 toTexture:g_sm.ccopy destinationSlice:0 destinationLevel:0 sliceCount:1
+            levelCount:1];
+    [b endEncoding];
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = ct;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:cp];
+    [e setFragmentTexture:g_sm.ccopy atIndex:2];
+    [e setFragmentTexture:g_ov_s atIndex:7];
+    [e setFragmentTexture:g_ov_t atIndex:8];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    g_ov_reset = 1, g_ov_done = g_serial;
+}
 
 /* this scene's maps (vpinv: its camera, clip to the world); the draws of the next look themselves up */
 static void rt_sun_maps(const double* vpinv, id<MTLBuffer> dyn_buf, NSUInteger dyn_off, uint32_t dyn_verts)
@@ -6168,7 +6306,20 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
     scene_done_impl(color, s);
 }
 
+static void world_final_light(void);
 void gfx_world_final(void)
+{
+    if (!g_dev)
+        return;
+    @autoreleasepool
+    {
+        flush_pass();
+        world_final_light();
+        rt_world_composite(); /* (when the lighting did not put the layers over the image) */
+    }
+}
+
+static void world_final_light(void)
 {
     g_late_last = g_late_serial == g_serial ? g_nlate : 0;
     if (g_fxd.serial == g_serial && g_fxd.color)

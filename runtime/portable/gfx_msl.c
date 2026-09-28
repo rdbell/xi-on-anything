@@ -443,7 +443,9 @@ static void op_expr(char* out, size_t n, int op, const char* a1, const char* a2,
 static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 {
     int pix = pixel_lit(vk);
-    sb_printf(b, "fragment float4 fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", pix ? "vin" : "in");
+    if (k->mrt)
+        sb_printf(b, "struct FsOut { float4 c [[color(0)]]; float4 s [[color(1)]]; float4 t [[color(2)]]; };\n");
+    sb_printf(b, "fragment %s fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", k->mrt ? "FsOut" : "float4", pix ? "vin" : "in");
     if (k->rt)
         sb_printf(b, ", constant RtDraw& rd [[buffer(5)]], depth2d_array<float> rt_sm [[texture(8)]]");
     for (int i = 0; i < 8; ++i)
@@ -539,7 +541,17 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
      * red, none blue) */
     if (k->rt)
         sb_printf(b, "  if (rd.k.y > 0.0) %s.rgb = rt_c == 0.0 ? float3(0.2, 0.3, 0.8) : mix(0.08, 1.0, rt_vis) * (rt_c == 1.0 ? float3(0.75, 1.0, 0.75) : rt_c == 2.0 ? float3(1.0, 1.0, 0.7) : rt_c == 3.0 ? float3(1.0, 0.75, 0.75) : float3(0.6, 0.5, 0.8));\n", col);
-    sb_printf(b, "  return %s;\n}\n", col);
+    /* the world's layers: the image, what the see-through adds (s) and what of the image shows through (t) */
+    if (k->mrt == 1)
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); return o;\n}\n", col);
+    else if (k->mrt == 2)
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = %s; return o;\n}\n", col, col, col);
+    else if (k->mrt == 3)
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = %s; o.t = float4(0.0); return o;\n}\n", col, col);
+    else if (k->mrt == 4)
+        sb_printf(b, "  FsOut o; o.c = %s; o.s = float4(0.0); o.t = float4(1.0); return o;\n}\n", col);
+    else
+        sb_printf(b, "  return %s;\n}\n", col);
 }
 
 static void emit_ff_fs(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
