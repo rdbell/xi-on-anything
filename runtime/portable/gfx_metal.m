@@ -151,7 +151,7 @@ static id<MTLTexture> g_scratch_depth;
 static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
-        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, rt, rt_proj, rt_sun_elev, rt_sun_azim, rt_shadow, rt_distance, rt_near, rt_debug, hide_ui, rt_sm_keep, rt_defer, rt_only_vs, rt_gi, rt_gi_radius, rt_soft, rt_point, rt_point_range, rt_glow, rt_glow_range, rt_moon, rt_point_far, rt_point_max, rt_point_sat, rt_sun_min, rt_hour, iface_end, rt_late, rt_mrt, rt_face, rt_sun_gain, hdr, hdr_exposure, hdr_contrast, hdr_black, hdr_white, hdr_knee, vfog, vfog_density, vfog_height, vfog_sun, vfog_ambient, vfog_g, draw,
         draw_entities, fps;
 } g_fxs;
 
@@ -2559,6 +2559,13 @@ static const struct
     { "rt_late", offsetof(__typeof__(g_fxs), rt_late), 0.0f },
     { "rt_mrt", offsetof(__typeof__(g_fxs), rt_mrt), 1.0f },
     { "rt_face", offsetof(__typeof__(g_fxs), rt_face), 0.6f },
+    { "rt_sun_gain", offsetof(__typeof__(g_fxs), rt_sun_gain), 0.5f },
+    { "hdr", offsetof(__typeof__(g_fxs), hdr), 1.0f },
+    { "hdr_exposure", offsetof(__typeof__(g_fxs), hdr_exposure), 1.0f },
+    { "hdr_contrast", offsetof(__typeof__(g_fxs), hdr_contrast), 1.15f },
+    { "hdr_black", offsetof(__typeof__(g_fxs), hdr_black), 0.02f },
+    { "hdr_white", offsetof(__typeof__(g_fxs), hdr_white), 1.6f },
+    { "hdr_knee", offsetof(__typeof__(g_fxs), hdr_knee), 0.8f },
     { "rt_glow_range", offsetof(__typeof__(g_fxs), rt_glow_range), 8.0f },
     { "vfog", offsetof(__typeof__(g_fxs), vfog), 1.0f },
     { "vfog_density", offsetof(__typeof__(g_fxs), vfog_density), 0.0f },
@@ -4521,7 +4528,7 @@ static const char DS_MSL[] =
     "using namespace metal;\n"
     "struct DS { float4x4 ivp; float4x4 s[3]; float4 cs[3]; float4 sun; float4 k; float4 fog; float4 fogc; float4 vp;\n"
     "            float4 pz; float4x4 rinv; float4 gi; float4 vf; float4 vf2; float4 sunc; float4 fwd; float4 pl;\n"
-    "            float4 lp[128]; float4 lc[128]; };\n"
+    "            float4 lp[128]; float4 lc[128]; float4 tm; float4 sg; };\n"
     "struct DO { float4 pos [[position]]; };\n"
     "vertex DO ds_vs(uint vid [[vertex_id]]) {\n"
     "  DO o; float2 t = float2((vid << 1) & 2, vid & 2); o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return o;\n"
@@ -4723,7 +4730,10 @@ static const char DS_MSL[] =
     /* darkened by a but the fog's share; the bounce light adds to what the surface shows, fogged alike */
     /* the colour as it is, less the shadow's share of what the fog leaves of the surface (no colour put in:
      * its texture stays whatever the fog is) */
-    "  float3 oc = col.rgb * (1.0 - a * f);\n"
+    /* darkened by the shadow's share, and brightened where the sun reaches (sg.x of its strength) - the fog's
+     * share of the surface alone either way */
+    "  float fade = 1.0 - smoothstep(0.85 * d.k.y, d.k.y, dist);\n"
+    "  float3 oc = col.rgb * (1.0 - a * f + d.sg.x * d.k.x * v * fade * f);\n"
     /* the bounce light where the sun does not reach (in full sun it is little beside it) */
     "  oc += col.rgb * gi * f * (1.0 - 0.75 * v);\n"
     /* the lamps and torches: each lights what faces it within its range, falling off smoothly */
@@ -4750,6 +4760,18 @@ static const char DS_MSL[] =
     "  }\n"
     "  return float4(oc, col.a);\n"
     "}\n"
+    /* the tone: exposure; contrast about the middle; the black level taken off; above the knee the rest of
+     * the range up to the white level rolled off into what is left below white */
+    "static float3 ds_tone(constant DS& d, float3 x) {\n"
+    "  x = max(x * d.tm.x, 0.0);\n"
+    "  x = 0.5 * pow(x / 0.5, float3(d.tm.y));\n"
+    "  x = max(x - d.tm.z, 0.0) / max(1.0 - d.tm.z, 1e-3);\n"
+    "  float k = d.sg.y, w = max(d.tm.w, k + 0.05);\n"
+    "  float cc = (1.0 - k) * (w - k) / max(w - 1.0, 1e-3);\n"
+    "  float3 t = max(x - k, 0.0);\n"
+    "  float3 y = select(x, k + t / (1.0 + t / cc), x > k);\n"
+    "  return saturate(y);\n"
+    "}\n"
     /* the lit image with the see-through layer over it (the world's layers, rt_mrt: pl.w) */
     "fragment float4 ds_fs(DO in [[stage_in]], constant DS& d [[buffer(0)]], depth2d<float> dep [[texture(0)]],\n"
     "                      depth2d_array<float> sm [[texture(1)]], texture2d<float> src [[texture(2)]],\n"
@@ -4758,6 +4780,7 @@ static const char DS_MSL[] =
     "                      texture2d<float> ls [[texture(7)]], texture2d<float> lt [[texture(8)]],\n"
     "                      texture2d<float> nt [[texture(9)]]) {\n"
     "  float4 c = ds_lit(in, d, dep, sm, src, rsm, ft, fd, st, nt);\n"
+    "  if (d.sg.w > 0.0 && d.k.z <= 0.0) c.rgb = ds_tone(d, c.rgb);\n"
     "  if (d.pl.w > 0.0) { uint2 p = uint2(in.pos.xy); c.rgb = c.rgb * lt.read(p).rgb + ls.read(p).rgb; }\n"
     "  return c;\n"
     "}\n"
@@ -4831,6 +4854,8 @@ typedef struct DsU
     float pl[4];    /* the point lights: how many, their strength */
     float lp[RT_LIGHTS][4]; /* each one's place (less the camera's) and range */
     float lc[RT_LIGHTS][4]; /* its colour */
+    float tm[4];    /* the tone: exposure, contrast, black level, white (the input level shown as white) */
+    float sg[4];    /* the sun's own light on what it reaches (a share of the colour), the tone's knee, on */
 } DsU;
 
 /* the pass into ct (its depth dep), for scene s */
@@ -4889,6 +4914,9 @@ static int rt_defer_pass(id<MTLTexture> ct, id<MTLTexture> dep, const GfxScene* 
     memcpy(u.sun, g_rtx.sun_now, 16);
     u.k[0] = g_rtx.k_now[0], u.k[1] = g_rtx.k_now[2], u.k[2] = g_fxs.rt_debug;
     u.fwd[3] = fminf(fmaxf(g_fxs.rt_face, 0.0f), 1.0f);
+    u.tm[0] = g_fxs.hdr_exposure, u.tm[1] = fmaxf(g_fxs.hdr_contrast, 0.1f), u.tm[2] = fminf(fmaxf(g_fxs.hdr_black, 0.0f), 0.5f);
+    u.tm[3] = fmaxf(g_fxs.hdr_white, 1.0f);
+    u.sg[0] = fmaxf(g_fxs.rt_sun_gain, 0.0f), u.sg[1] = fminf(fmaxf(g_fxs.hdr_knee, 0.3f), 0.98f), u.sg[3] = g_fxs.hdr != 0.0f;
     if (g_zfog_serial == g_serial && g_zfog[0] != 0.0f)
         memcpy(u.fog, g_zfog, 16);
     memcpy(u.fogc, s->fogcolor, 16);
