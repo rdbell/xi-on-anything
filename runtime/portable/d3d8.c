@@ -980,7 +980,11 @@ static void IDirect3D8_CreateDevice(Guest* g)
     /* windowed devices ignore the presentation interval and wait for the display; so do we unless
      * a full-screen device asks for IMMEDIATE */
     user32_set_fullscreen(d->hwnd, !d->pp[7]);
-    gfx_init(user32_sdl_window(d->hwnd), d->pp[7] || d->pp[12] != 0x80000000u);
+    /* FFXI_VSYNC=0 (local trial): never wait for the display */
+    int vsync = d->pp[7] || d->pp[12] != 0x80000000u;
+    if (getenv("FFXI_VSYNC") && getenv("FFXI_VSYNC")[0] == '0')
+        vsync = 0;
+    gfx_init(user32_sdl_window(d->hwnd), vsync);
     obj_addref(d->d3d);
     d->guest = obj_new(O_DEVICE);
     d->backbuffer = new_surface(d->pp[2], d->pp[0], d->pp[1], USAGE_RENDERTARGET, 0, 0);

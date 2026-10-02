@@ -153,7 +153,7 @@ static void find_fps_global(void)
         {
             g_fps_global = rd32(a + sizeof PAT);
             rt_log("[recomp] frame-rate divisor: global %08x (code at %08x), set to %u (%u fps)\n", g_fps_global, a,
-                g_fps_divisor, 60 / g_fps_divisor);
+                g_fps_divisor, g_fps_divisor ? 60 / g_fps_divisor : 0);
             return;
         }
     rt_log("[recomp] frame-rate divisor: not found; the game keeps its own frame rate\n");
@@ -758,9 +758,9 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--fps-divisor"))
         {
             long d = strtol(argv[i + 1], NULL, 10);
-            if (d < 1 || d > 60)
+            if (d < 0 || d > 60)
             {
-                fprintf(stderr, "--fps-divisor: 1 (60 fps), 2 (30 fps, as shipped), ...\n");
+                fprintf(stderr, "--fps-divisor: 0 (uncapped), 1 (60 fps), 2 (30 fps, as shipped), ...\n");
                 return 2;
             }
             g_fps_divisor = (uint32_t)d;
