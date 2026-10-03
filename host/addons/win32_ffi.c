@@ -27,6 +27,7 @@
 #include "d3d8.h"
 #include "d3d_ffi.h"
 #include "host.h"
+#include "plat.h"
 #include "res.h"
 #include "user32.h"
 
@@ -534,6 +535,17 @@ XI_FFI int32_t QueryPerformanceFrequency(int64_t* f)
         return 0;
     *f = 1000000000;
     return 1;
+}
+
+/* FILETIME is two 32-bit words even on LP64. Keep this export independent of
+ * the guest's k32 thunk so native LuaJIT can anchor QPC timestamps to UTC. */
+XI_FFI void GetSystemTimeAsFileTime(uint32_t* filetime)
+{
+    if (!filetime)
+        return;
+    uint64_t ticks = plat_wall_ms() * 10000u + 116444736000000000ull;
+    filetime[0] = (uint32_t)ticks;
+    filetime[1] = (uint32_t)(ticks >> 32);
 }
 
 /* On the game's thread: capped, so an addon can't hang the game. */

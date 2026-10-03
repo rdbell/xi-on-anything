@@ -33,7 +33,7 @@
  *   pet status block   Ashita   0x1009CEE0  +61 = 0x10482F28  0x18 bytes from packet 0x068 (+4):
  *                                                +8 u16 pet index, +0xB MP%, +0xC u32 TP
  *   SetTarget          Ashita   0x1007A617  (4 hits, use 0) call at +0x16 -> 0x10157B40, thiscall on
- *                                                [0x1057876C] (target_t*) with (entity_t*, 1, 0)
+ *                                                [0x1057876C] (target_t*) with (ActorPointer, 1, 0)
  *
  * The function-shaped ones (job levels, known spells/abilities, master flags) are decoded from
  * their instruction bytes (the offsets they index with) and read directly: no guest call, no
@@ -998,8 +998,28 @@ int xi_game_set_target(uint32_t index)
     uint32_t fn = site + 0x1B + rel, target = xi_game_rd32(g), ent = xi_game_entity(index);
     if (target == 0 || ent == 0)
         return 0;
-    uint32_t args[3] = {ent, 1, 0};
-    guest_thiscall(fn, target, 3, args);
+    // The game's index setter loads [entity+ActorPointer] before this call.
+    // The callee treats actor+0x70 as its backlink to the outer entity.
+    uint32_t actor = xi_game_rd32(ent + XI_OFS_entity_ActorPointer);
+    if (!actor || !xi_mapped(actor, 0x74) || xi_game_rd32(actor + 0x70) != ent)
+        return 0;
+    uint32_t args[3] = {actor, 1, 0};
+    const char* diagnostics = getenv("FFXI_ADDON_DIAGNOSTICS");
+    int diag = diagnostics && diagnostics[0] == '1';
+    if (diag)
+    {
+        Guest* context = &gt_self()->g;
+        fprintf(stderr, "[addon-diag] set_target begin index=%u site=%08x fn=%08x global=%08x self=%08x entity=%08x actor=%08x ecx=%08x esp=%08x\n",
+            index, site, fn, g, target, ent, actor, context->ecx, context->esp);
+        fflush(stderr);
+    }
+    uint32_t result = guest_thiscall(fn, target, 3, args);
+    if (diag)
+    {
+        Guest* context = &gt_self()->g;
+        fprintf(stderr, "[addon-diag] set_target end index=%u result=%08x ecx=%08x esp=%08x\n", index, result, context->ecx, context->esp);
+        fflush(stderr);
+    }
     return 1;
 #endif
 }

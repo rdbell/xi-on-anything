@@ -512,6 +512,10 @@
         "write_line": "0x100765d0",
         "packet_decrypt": "0x100dd400",
         "packet_encrypt": "0x100dd2d0"
+      },
+      "android_wraps": {
+        "probe_ctor": "0x1006c070",
+        "probe_dtor": "0x1006c080"
       }
     }
   }

@@ -102,6 +102,9 @@
 #include "plat.h"
 #include "vfs.h"
 #include "build.h" /* FFXI_VERSION */
+#if defined(FFXI_ANDROID_VULKAN)
+#include "benchmark.h"
+#endif
 
 extern const RtModule rt_module_ffxi; /* recomp.py --module ffxi */
 
@@ -573,6 +576,9 @@ static void shadow_focus(void)
 
 static void present_hook(void)
 {
+#if defined(FFXI_ANDROID_VULKAN)
+    benchmark_frame();
+#endif
     if (g_profile_shims)
     {
         static uint64_t last;
@@ -918,6 +924,9 @@ int main(int argc, char** argv)
             return 2;
         }
     }
+#if defined(FFXI_ANDROID_VULKAN)
+    if (benchmark_init(lsb.user) < 0) return 1;
+#endif
     if (lsb.user)
     {
         /* a LandSandBoat server: sign in before anything is loaded, so a refusal costs nothing */

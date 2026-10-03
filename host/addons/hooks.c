@@ -79,6 +79,7 @@ static uint32_t guest_scratch(int which, uint32_t size)
 /* --- the command line ------------------------------------------------------------------------ */
 
 static int g_injecting; /* the line parse_input sees is one the host runs (queued commands) */
+static int addon_diagnostics(void) { const char* v=getenv("FFXI_ADDON_DIAGNOSTICS"); return v && *v=='1'; }
 static int g_raw;       /* ... and one that already went through the host and addons: straight to the game */
 
 #if defined(FFXI_WRAP_PARSE_INPUT)
@@ -89,6 +90,7 @@ static void wrap_parse_input(Guest* g)
     int mode = (int)rt_arg(g, 1);
     guest_str(text, line, sizeof line);
     int injected = g_injecting;
+    if (addon_diagnostics()) xi_log("parse wrapper injected=%d raw=%d line=%s",injected,g_raw,line);
     g_injecting = 0;
     if (g_raw)
     {
@@ -242,6 +244,7 @@ static void game_run(int mode, const char* line, int raw)
     uint32_t args[2] = { s, (uint32_t)mode };
     g_injecting = 1;
     g_raw = raw;
+    if (addon_diagnostics()) xi_log("queued command raw=%d fn=%08x line=%s",raw,FFXI_WRAP_PARSE_INPUT,line);
     guest_call(FFXI_WRAP_PARSE_INPUT, 2, args);
     g_injecting = 0;
     g_raw = 0;
@@ -619,6 +622,7 @@ void xi_hooks_init(void)
 {
 #if defined(FFXI_WRAP_PARSE_INPUT)
     rt_wrap_parse_input = wrap_parse_input;
+    if (addon_diagnostics()) xi_log("parse wrapper installed fn=%08x",FFXI_WRAP_PARSE_INPUT);
 #endif
 #if defined(FFXI_WRAP_WRITE_LINE)
     rt_wrap_write_line = wrap_write_line;

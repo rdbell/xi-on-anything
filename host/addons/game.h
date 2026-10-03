@@ -195,7 +195,7 @@ int32_t xi_game_spell_recast(uint32_t id); /* 1/60 s, -1 */
 
 int xi_game_pet(uint32_t* mpp, uint32_t* tp, uint32_t* index); /* 1 if the player has a pet */
 
-/* Targets entity `index` the way the game's own call sites do (target_t::SetTarget(entity, 1, 0)
+/* Targets entity `index` the way the game's own call sites do (target_t::SetTarget(entity.ActorPointer, 1, 0)
  * through guest_thiscall). 1 if called. Not available in XI_GAME_NO_GUEST_CALL builds. */
 int xi_game_set_target(uint32_t index);
 

@@ -20,6 +20,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ANDROID__) && defined(__aarch64__)
+#include <ucontext.h>
+#include <dlfcn.h>
+#endif
 
 #include "host.h"
 #include "addons.h"
@@ -347,6 +351,9 @@ void xi_addon_error(Addon* a, const char* where, const char* msg)
 static RT_TLS sigjmp_buf* t_guard;
 static RT_TLS volatile int t_fault_sig;
 static RT_TLS volatile uintptr_t t_fault_addr;
+#if defined(__ANDROID__) && defined(__aarch64__)
+static RT_TLS volatile uintptr_t t_fault_pc;
+#endif
 static struct sigaction g_old_segv, g_old_bus;
 
 static void on_fault(int sig, siginfo_t* si, void* ctx)
@@ -355,6 +362,9 @@ static void on_fault(int sig, siginfo_t* si, void* ctx)
     {
         t_fault_sig = sig;
         t_fault_addr = (uintptr_t)si->si_addr;
+#if defined(__ANDROID__) && defined(__aarch64__)
+        t_fault_pc = (uintptr_t)((ucontext_t*)ctx)->uc_mcontext.pc;
+#endif
         siglongjmp(*t_guard, 1);
     }
     /* not ours: whoever had it before (the default: a crash report) */
@@ -446,6 +456,15 @@ static int guarded_pcall(Addon* a, lua_State* L, int nargs, int nres, int errfun
         snprintf(msg, sizeof msg, "native fault (signal %d at %p): the addon is stopped", t_fault_sig, (void*)t_fault_addr);
         a->dead = 1;
         xi_log("%s: %s", a->name, msg);
+#if defined(__ANDROID__) && defined(__aarch64__)
+        if (getenv("FFXI_ADDON_DIAGNOSTICS") && *getenv("FFXI_ADDON_DIAGNOSTICS")=='1') {
+            Dl_info d={0}; dladdr((const void*)t_fault_pc,&d);
+            Guest* fg=&gt_self()->g;
+            xi_log("faultdiag pc=%p elf-offset=0x%llx symbol=%s ecx=%08x edx=%08x esp=%08x",
+                (void*)t_fault_pc,(unsigned long long)(t_fault_pc-(uintptr_t)d.dli_fbase),
+                d.dli_sname?d.dli_sname:"?",fg->ecx,fg->edx,fg->esp);
+        }
+#endif
         chatf("[%s] crashed in native code and was stopped (the game carries on)", a->name);
         return -1;
     }

@@ -186,6 +186,7 @@ typedef struct GfxDraw
     GfxDepthKey depth;
     const uint32_t* vs_tokens; /* the shader behind vs.prog / fs.prog */
     const uint32_t* ps_tokens;
+    uint32_t vs_token_count, ps_token_count; /* exact owned words, including END; 0: worker drains/direct */
     GfxU u;
     GfxTex* tex[8];
     GfxSampler samp[8];
@@ -242,6 +243,16 @@ void gfx_tex_read(GfxTex* t, uint32_t face, uint32_t level, void* dst, uint32_t 
  * and a new copy queued behind this frame's work. Only the first read of a level waits. For
  * read-only locks the game polls every frame (FFXI's occlusion probe). */
 void gfx_tex_read_async(GfxTex* t, uint32_t face, uint32_t level, void* dst, uint32_t pitch);
+#if defined(FFXI_ANDROID_VULKAN)
+/* Opt-in delayed GPU pixels, scoped to a caller-supplied logical lifetime key.
+ * Only completed copies issued in an earlier frame and no older than max_age
+ * are eligible. Unknown key0, age0, duplicate same-frame reads and overflow
+ * read current pixels exactly. This is a temporal rendering tradeoff. */
+void gfx_tex_read_async_keyed(GfxTex* t, uint32_t face, uint32_t level, void* dst, uint32_t pitch,
+    uint64_t key, uint32_t max_age);
+/* Low-rate aggregate admission counters, reported with existing frame stats. */
+void gfx_android_probe_read(int known_key, int async_enabled);
+#endif
 /* A rectangle between textures of one format. */
 void gfx_copy(GfxTex* src, uint32_t sface, uint32_t slevel, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h,
     GfxTex* dst, uint32_t dface, uint32_t dlevel, uint32_t dx, uint32_t dy);
