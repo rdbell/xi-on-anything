@@ -1176,6 +1176,7 @@ void profile_frame(uint64_t started) {
 
 extern "C" {
 #include "present_rect.h"
+uint64_t gfx_window_flags(void) { return SDL_WINDOW_VULKAN; }
 int gfx_profiling=0;
 
 /* Native FFI diagnostic only; path must be an absent file in an owned writable

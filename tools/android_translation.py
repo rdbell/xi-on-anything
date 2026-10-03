@@ -61,6 +61,12 @@ def main():
     if args.generate:
         folder=ROOT/'generated/images'/original['build']
         cmd=[sys.executable,str(ROOT/'recomp/recomp.py'),'--meta',original['ffximain_meta'],'--image',str(folder/'FFXiMain.unpacked.dll'),'--retail',str(folder/'FFXiMain.retail.dll'),'--out',str(ROOT/'generated/android-all'),'--wraps',','.join(k+'='+v for k,v in configuration['wraps'].items()),'--all']
+        if configuration['hooks']:
+            cmd+=['--hooks',','.join(k+'='+v for k,v in configuration['hooks'].items())]
+        if configuration['patches']:
+            patches=ROOT/'generated/android-patches.json'
+            patches.write_text(json.dumps(configuration['patches'],indent=2)+'\n')
+            cmd+=['--patches',str(patches)]
         subprocess.run(cmd,cwd=ROOT,check=True)
     table=(ROOT/'generated/android-all/table.c').read_text()
     rows=len(re.findall(r'^    \{ 0x[0-9A-Fa-f]+u, f_',table,re.M))

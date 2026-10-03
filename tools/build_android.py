@@ -18,7 +18,7 @@ CACHE=ROOT.parent/'android/cache/xi-native-android'
 SDL=CACHE/'SDL3-3.4.16'
 FLAGS=['-O2','-g','-fPIC','-ffixed-x18','-fno-strict-aliasing','-DRT_GUEST_WINDOW','-DFFXI_ANDROID_VULKAN','-I'+str(ROOT/'runtime'),'-I'+str(ROOT/'runtime/portable'),'-I'+str(OUT/'generated'),'-I'+str(ROOT/'generated'),'-I'+str(ROOT/'third_party/stb'),'-I'+str(SDL/'include')]
 PORTABLE=[x.replace('\\','/').replace('plat_win.c','plat_posix.c') for x in build.PORTABLE]
-HOST=['runtime/portable/user32.c','runtime/portable/d3d8.c','runtime/portable/dsound.c','runtime/portable/input.c','runtime/portable/dinput.c','runtime/portable/ws2.c','host/host64.c','host/lsb_login.c','host/datui.c','host/uidraw.c','host/modern.c','host/discord.c','host/signin.c','host/sewave.c','host/ui_art.c','host/keychain.c','host/appdefaults.c']
+HOST=['runtime/portable/user32.c','runtime/portable/d3d8.c','runtime/portable/dsound.c','runtime/portable/input.c','runtime/portable/dinput.c','runtime/portable/ws2.c','host/host64.c','host/lsb_login.c','host/datui.c','host/uidraw.c','host/modern.c','host/cexi.c','host/discord.c','host/signin.c','host/sewave.c','host/ui_art.c','host/keychain.c','host/appdefaults.c']
 ADDONS=sorted(str(x.relative_to(ROOT)) for x in (ROOT/'host/addons').iterdir() if x.suffix in ('.c','.cpp'))+['generated/addons_lua.c']
 WARN=['-Wno-unused-label','-Wno-unused-variable','-Wno-unused-but-set-variable','-Wno-unused-function','-Wno-parentheses-equality','-Wno-unreachable-code']
 def run(args,**kw):
@@ -113,6 +113,6 @@ def main():
     objs+=compile_many(['tests/gfx_format_test.c'],'host-format-test',extra+['-Dmain=xi_format_test_main'])
     objs+=compile_many(['tests/gfx_state_test.c'],'host-state-test',extra+['-Dmain=xi_state_test_main'])
     objs+=compile_many(['tests/gfx_async_test.c'],'host-async-test',extra+['-Dmain=xi_async_test_main'])
-    run([CXX,'-shared','-Wl,-soname,libmain.so','-Wl,-z,max-page-size=16384','-static-libstdc++','-Wl,--export-dynamic','-o',OUT/'libmain.so']+objs+['-Wl,--start-group']+libs+spv['libs']+['-Wl,--end-group',str(sdl_lib),'-lvulkan','-llog','-landroid','-lm','-ldl'])
+    run([CXX,'-shared','-Wl,--no-undefined','-Wl,-soname,libmain.so','-Wl,-z,max-page-size=16384','-static-libstdc++','-Wl,--export-dynamic','-o',OUT/'libmain.so']+objs+['-Wl,--start-group']+libs+spv['libs']+['-Wl,--end-group',str(sdl_lib),'-lvulkan','-llog','-landroid','-lm','-ldl'])
     print('built',OUT/'libmain.so')
 if __name__=='__main__':main()
