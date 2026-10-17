@@ -327,8 +327,9 @@ The `parse_input` wrap calls the router with `(line, mode, injected)`:
 
 1. Host commands: `//addon`, `/addon`, `//lua` (Windower's `lua load|unload|reload|list|command`),
    `//exec`, `//bind`, `/bind`, `//alias`, `/alias`, `//unbind`, and Windower's Config plugin for
-   `//config FrameRateDivisor`: 0 uncaps (FastCS, through a cutscene), any other value hands the
-   frame rate back to the player's own.
+   `//config FrameRateDivisor`: 0 uncaps (FastCS, through a cutscene; a zone change still goes at the
+   player's rate, as host64 holds uncapped to zones), any other value hands the frame rate back to
+   the player's own.
 2. Aliases (Ashita `/alias`, Windower `alias`) expand, then re-enter the router.
 3. Addons' `command` events (Ashita: every addon sees it with `blocked`; Windower: `addon command`
    for `//<name|_addon.command(s)>`).

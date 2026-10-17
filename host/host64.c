@@ -27,7 +27,7 @@
  * as retail's do, and --server is not used.
  *
  * --fps-divisor: FFXI's frames are 60 / divisor per second; 1 (60 fps) here, 2 (30) as shipped;
- * 0 uncapped.
+ * 0 uncapped, in a zone (signing in and zone changes go at 60: see the frame rate below).
  *
  * --aspect auto|off|<w:h>: the 3D scene's aspect ratio. auto (the default) follows the window's
  * shape, so a widescreen window shows more to the sides instead of a 4:3 view stretched across it.
@@ -148,9 +148,13 @@ static uint32_t com_call(uint32_t obj, unsigned slot, unsigned nargs, const uint
  * `sub esp, 0x100; cmp eax, ecx; je +0x21; mov ecx, [global]` names the global that points at
  * the object, and the divisor is at +0x30. The game may reset it (zoning), so every frame puts
  * it back: the player's (g_fps_divisor, Config > Display > Frame Rate), or an addon's for the
- * session (g_fps_addon: Ashita's fps addon, FastCS through a cutscene), until the player picks one. */
+ * session (g_fps_addon: Ashita's fps addon, FastCS through a cutscene), until the player picks one.
+ * Uncapped (0) holds only in a zone: the client counts its timeouts in frames, and a zone change's
+ * screens, drawing next to nothing, ran at thousands a second until it gave up on a server that was
+ * answering (FFXI-3001). Out of one, the player's own rate stands in (60 if that is 0 too). */
 static uint32_t g_fps_divisor = 1, g_fps_global;
 static int g_fps_addon = -1; /* an addon's divisor (fps_request); -1 none */
+static int g_fps_held;       /* uncapped asked for, and held to a rate: not in a zone */
 
 static void find_fps_global(void)
 {
@@ -760,6 +764,17 @@ static void present_hook(void)
     if (g_fps_global == 0xFFFFFFFFu)
         return;
     uint32_t want = g_fps_addon >= 0 ? (uint32_t)g_fps_addon : g_fps_divisor;
+    int held = want == 0 && xi_game_login_status() != 2;
+    if (held)
+        want = g_fps_divisor ? g_fps_divisor : 1;
+    if (held != g_fps_held)
+    {
+        g_fps_held = held;
+        if (held)
+            rt_log("[recomp] frame-rate divisor: %u until the next zone (uncapped holds only in one)\n", want);
+        else if (want == 0) /* (else the uncapped one ended: fps_request said so) */
+            rt_log("[recomp] frame-rate divisor: uncapped again, in the zone\n");
+    }
     uint32_t object = rd32(g_fps_global);
     if (object && rd32(object + 0x30) != want)
         wr32(object + 0x30, want);
@@ -953,7 +968,7 @@ int main(int argc, char** argv)
             long d = strtol(argv[i + 1], NULL, 10);
             if (d < 0 || d > 60)
             {
-                fprintf(stderr, "--fps-divisor: 0 (uncapped), 1 (60 fps), 2 (30 fps, as shipped), ...\n");
+                fprintf(stderr, "--fps-divisor: 0 (uncapped, in a zone), 1 (60 fps), 2 (30 fps, as shipped), ...\n");
                 return 2;
             }
             g_fps_divisor = (uint32_t)d;
