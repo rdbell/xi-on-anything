@@ -5,7 +5,6 @@
 #include "geometry_guest.h"
 #include "runtime.h"
 #include <stdlib.h>
-#include <string.h>
 
 #if FFXI_GEOMETRY_LAYOUT == 1
 #define ORIGINAL(name)                                                                                                 \
@@ -33,7 +32,7 @@ static void weighted(Guest* g) { geometry_guest_weighted(g, rt_orig_geometry_wei
 void geometry_hooks_init(void)
 {
     const char* enabled = getenv("FFXI_NATIVE_GEOMETRY");
-    if (enabled && !strcmp(enabled, "0"))
+    if (enabled && enabled[0] == '0')
     {
         rt_log("[recomp] geometry: FFXI_NATIVE_GEOMETRY=0: original translation retained\n");
         return;
