@@ -1,11 +1,10 @@
 # Shared graphics work from the Android port
 
 CPU skinning kernels that keep the game's own SSE arithmetic, and guarded adapters that let the
-recompiled client use them in place of the translated x87 code. They are off by default: set
-
-`FFXI_NATIVE_GEOMETRY=1` to use them, on the verified `2025-11-12` build only. The work came from
-the [Android port](android.md); the last sections cover what of that port carries over to the
-desktop renderers, which are unchanged.
+recompiled client use them in place of the translated x87 code. They are on by default on the
+verified `2025-11-12` build; `FFXI_NATIVE_GEOMETRY=0` keeps the translation. The work came from the
+[Android port](android.md); the last sections cover what of that port carries over to the desktop
+renderers, which are unchanged.
 
 ## Geometry kernels
 
@@ -16,8 +15,10 @@ C interface. It depends on no graphics API, so the Metal, D3D12 and Vulkan hosts
 The kernels keep the original SSE sequence of binary32 operations, with FMA and reassociation
 off. When a result is a NaN they redo the vertex one operation at a time, to keep SSE's NaN
 selection, quieting and negative indefinite. This is not the arithmetic of the translated scalar
-x87 path, which keeps more intermediate precision. It stays opt-in on desktop, where it showed no
-gain (see Desktop measurements).
+x87 path, which keeps more intermediate precision, but it is the retail client's: the game picks
+its skinning path from CPUID, so on any PC with SSE it runs the SSE branch. The recompiled client
+reports no SSE (`rt_cpuid`, `IsProcessorFeaturePresent`), which is why the translation takes the
+x87 branch. Vertices differ from the x87 path's by a few units in the last place.
 
 Inputs and outputs are unaligned byte spans, not guest pointers. Each kernel reads every input
 before writing either 12-byte XYZ result, so outputs may alias matrices, source vertices or each
@@ -25,10 +26,10 @@ other. The caller must own those spans for the whole call. `geometry_simd_suppor
 host floating-point controls once per batch without changing them; if they are unsupported, the
 caller runs the original path. The arithmetic may set floating-point status flags.
 
-The kernels are linked into the portable game hosts. `FFXI_NATIVE_GEOMETRY=1` installs the adapters
-only for a build whose `meta/builds.json` entry has a verified `geometry` layout; other builds keep
-the translation. No global CPUID or feature-byte change is made. Generated game C, captures and game
-files are not in the repository.
+The kernels are linked into the portable game hosts. They install the adapters, unless
+`FFXI_NATIVE_GEOMETRY=0`, only for a build whose `meta/builds.json` entry has a verified `geometry`
+layout; other builds keep the translation. No global CPUID or feature-byte change is made.
+Generated game C, captures and game files are not in the repository.
 
 ### Tests
 
@@ -70,7 +71,10 @@ parent admits a batch only while the current thread holds the guest lock, and ke
 checks and at most 4,096 weighted work units. Before changing any guest state it checks mapped
 guest pages, address overflow, stack bounds, aliases, counts, remap indices, the callback and
 feature modes, the guest FCW and the host FP controls. A rejected batch runs the original
-translation.
+translation. The log names each reason the first time a batch is rejected for it, and again at
+every power of two, with the count admitted so far, e.g. `geometry: 4 batches left to the
+translation (work cap), 91233 admitted`. The reasons are game or host state, no work, layout,
+work cap, unmapped page and alias.
 
 Only inside an admitted parent, on the same thread and Guest, do the feature getters report SSE
 and the two leaves call the kernels. Every other call runs the original body, and an extension's
@@ -128,7 +132,11 @@ renderer), with a `2025-11-12` HorizonXI install and the committed replay scenes
   mob spells 16% faster. Scenes at the 60 FPS cap (city, dawn, wind) were unchanged.
 
 So on this desktop the adapter matches the game's SSE code and draws the same scenes, with no
-regression and no gain that rises above the noise. macOS and Windows frame rates are not measured.
+regression. These frame-rate runs could not show a gain: with Modern FX the frame was bound by the
+shadow replay, the cities were at the 60 FPS cap, and the machine's load varied between runs. On a
+ROG Ally (Ryzen Z1), where the long player-crowd scene with `fx = 0` is bound by the game's own
+code, the adapter took it from 77 to 87 FPS in each of two sessions, and skinning from 3.65 ms to
+2.29 ms a frame. macOS and Windows frame rates are not measured.
 
 ## Android build
 

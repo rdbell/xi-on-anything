@@ -1,6 +1,6 @@
 /* geometry_guest.c's wrappers on this build's skinning functions (meta/builds.json "wraps" and
- * "geometry"). Off unless FFXI_NATIVE_GEOMETRY=1; builds without a verified layout keep the
- * translation. Each wrapper falls back to the original body it replaces. */
+ * "geometry"). On by default; FFXI_NATIVE_GEOMETRY=0 keeps the translation, as do builds without a
+ * verified layout. Each wrapper falls back to the original body it replaces. */
 #include "build.h"
 #include "geometry_guest.h"
 #include "runtime.h"
@@ -33,8 +33,11 @@ static void weighted(Guest* g) { geometry_guest_weighted(g, rt_orig_geometry_wei
 void geometry_hooks_init(void)
 {
     const char* enabled = getenv("FFXI_NATIVE_GEOMETRY");
-    if (!enabled || strcmp(enabled, "1"))
+    if (enabled && !strcmp(enabled, "0"))
+    {
+        rt_log("[recomp] geometry: FFXI_NATIVE_GEOMETRY=0: original translation retained\n");
         return;
+    }
 #if FFXI_GEOMETRY_LAYOUT == 1
     /* all or nothing, and never over another extension's wrapper */
     if (rt_wrap_geometry_parent || rt_wrap_geometry_feature_sse || rt_wrap_geometry_feature_sse2 ||
@@ -45,7 +48,9 @@ void geometry_hooks_init(void)
     rt_wrap_geometry_rigid = rigid;
     rt_wrap_geometry_weighted = weighted;
     rt_wrap_geometry_parent = parent;
-    rt_log("[recomp] geometry: opt-in SSE-order adapter installed for %s; guarded fallback active\n", FFXI_BUILD);
+    rt_log("[recomp] geometry: SSE-order adapter installed for %s (FFXI_NATIVE_GEOMETRY=0 turns it off); guarded "
+           "fallback active\n",
+           FFXI_BUILD);
 #else
     rt_log("[recomp] geometry: no verified adapter for %s; original translation retained\n", FFXI_BUILD);
 #endif

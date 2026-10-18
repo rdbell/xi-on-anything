@@ -83,23 +83,21 @@ static void parent(Guest* g)
     need(rd8(0x2409) == 0 && rd8(0x240c) == 0, "global features unchanged");
     ++exercised;
 }
+/* FFXI_NATIVE_GEOMETRY=s, or unset with NULL */
 static void enable(const char* s)
 {
 #ifdef _WIN32
-    need(_putenv_s("FFXI_NATIVE_GEOMETRY", s) == 0, "set environment");
+    need(_putenv_s("FFXI_NATIVE_GEOMETRY", s ? s : "") == 0, "set environment");
 #else
-    need(setenv("FFXI_NATIVE_GEOMETRY", s, 1) == 0, "set environment");
+    need((s ? setenv("FFXI_NATIVE_GEOMETRY", s, 1) : unsetenv("FFXI_NATIVE_GEOMETRY")) == 0, "set environment");
 #endif
 }
 int main(void)
 {
     enable("0");
     geometry_hooks_init();
-    need(!rt_wrap_geometry_parent, "default disabled");
-    enable("yes");
-    geometry_hooks_init();
-    need(!rt_wrap_geometry_parent, "explicit one required");
-    enable("1");
+    need(!rt_wrap_geometry_parent, "=0 disabled");
+    enable(NULL);
 #if FFXI_GEOMETRY_LAYOUT == 0
     geometry_hooks_init();
     need(!rt_wrap_geometry_parent && !calls && !feature_calls && !leaf_calls && !exercised,
@@ -109,10 +107,18 @@ int main(void)
     geometry_hooks_init();
     need(!rt_wrap_geometry_parent && rt_wrap_geometry_rigid == leaf, "occupied hooks retained");
     rt_wrap_geometry_rigid = NULL;
+    enable("1");
     geometry_hooks_init();
     need(rt_wrap_geometry_parent && rt_wrap_geometry_feature_sse && rt_wrap_geometry_feature_sse2 &&
              rt_wrap_geometry_rigid && rt_wrap_geometry_weighted,
-         "complete hook set");
+         "=1 installs");
+    rt_wrap_geometry_parent = rt_wrap_geometry_feature_sse = rt_wrap_geometry_feature_sse2 = NULL;
+    rt_wrap_geometry_rigid = rt_wrap_geometry_weighted = NULL;
+    enable(NULL);
+    geometry_hooks_init();
+    need(rt_wrap_geometry_parent && rt_wrap_geometry_feature_sse && rt_wrap_geometry_feature_sse2 &&
+             rt_wrap_geometry_rigid && rt_wrap_geometry_weighted,
+         "default complete hook set");
     Guest g;
     memset(&g, 0, sizeof g);
     g.esp = 0x10000;

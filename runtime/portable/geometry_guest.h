@@ -25,6 +25,6 @@ int geometry_guest_run(Guest* g, const GeometryLayout* layout, GuestFn body);
 void geometry_guest_feature(Guest* g, GuestFn original);
 void geometry_guest_rigid(Guest* g, GuestFn original);
 void geometry_guest_weighted(Guest* g, GuestFn original);
-/* Installs the wrappers if FFXI_NATIVE_GEOMETRY=1 and this build has a verified layout. Called
+/* Installs the wrappers unless FFXI_NATIVE_GEOMETRY=0, if this build has a verified layout. Called
  * after the game image has loaded. */
 void geometry_hooks_init(void);
