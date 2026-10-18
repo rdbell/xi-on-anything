@@ -50,6 +50,7 @@
 #include "cachedir.h"
 #include "gfx.h"
 #include "gfx_fx.h"
+#include "gfx_key.h"
 #include "gfx_msl.h"
 #include "gfx_scene.h"
 
@@ -270,26 +271,17 @@ typedef struct Map
     uint32_t cap, n;
 } Map;
 
-static uint64_t fnv(const void* p, size_t n)
-{
-    const uint8_t* b = (const uint8_t*)p;
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < n; ++i)
-        h = (h ^ b[i]) * 1099511628211ull;
-    return h ? h : 1;
-}
-
 static void* map_get(Map* m, const void* key, size_t klen)
 {
     if (!m->cap)
         return NULL;
-    uint64_t h = fnv(key, klen);
+    uint64_t h = gfx_key_hash(key, klen);
     for (uint32_t i = (uint32_t)h & (m->cap - 1);; i = (i + 1) & (m->cap - 1))
     {
         MapEnt* e = &m->e[i];
         if (!e->hash)
             return NULL;
-        if (e->hash == h && e->klen == klen && !memcmp(e->key, key, klen))
+        if (e->hash == h && e->klen == klen && gfx_key_eq(e->key, key, klen))
             return e->obj;
     }
 }
@@ -313,7 +305,7 @@ static void map_put(Map* m, const void* key, size_t klen, void* obj)
             }
         free(old.e);
     }
-    uint64_t h = fnv(key, klen);
+    uint64_t h = gfx_key_hash(key, klen);
     uint32_t j = (uint32_t)h & (m->cap - 1);
     while (m->e[j].hash)
         j = (j + 1) & (m->cap - 1);
