@@ -482,7 +482,7 @@ static uint64_t completed(void)
  * the draws changes (GfxDraw.site) and around the back end's own passes; each second, <path> gets the time and
  * draws per site since the last. A probe for the census of the game's draws; off, it costs a test per draw. */
 #define TS_MAX 4096
-enum { TS_FRAME = 1, TS_FX, TS_SUN, TS_MIPS, TS_PRESENT, TS_END };
+enum { TS_FRAME = 1, TS_FX, TS_SUN, TS_MIPS, TS_PRESENT, TS_END, TS_COPY, TS_WATER, TS_FXP = 16 };
 typedef struct { VkQueryPool pool; uint32_t n; uint64_t tag[TS_MAX]; uint32_t draws[TS_MAX]; } TsFrame;
 typedef struct { uint64_t tag, ns; uint32_t draws, segs, used; } TsSum;
 static int g_ts_on = -1;
@@ -3281,6 +3281,17 @@ static void fx_pass(GfxTex* target, uint32_t level, int load, VkPipeline p, cons
     const VkImageView* sh, const int32_t* dir)
 {
     end_pass();
+    if (g_ts_on > 0)
+    {
+        /* each kind of pass its own tag: TS_FXP + its index here */
+        const VkPipeline k[] = { g_fx.linz_pipe, g_fx.zmip_pipe, g_fx.ao_pipe, g_fx.blur_pipe, g_fx.temporal_pipe, g_fx.gi_pipe,
+            g_fx.gitemp_pipe, g_fx.bright_pipe, g_fx.gauss_pipe, g_fx.down_pipe, g_fx.raymask_pipe, g_fx.rays_pipe,
+            g_fx.comp_pipe, g_fx.aa_pipe, g_fx.mip_pipe };
+        uint32_t i = 0;
+        while (i < sizeof k / sizeof k[0] && k[i] != p)
+            ++i;
+        ts_mark(TS_FXP + i);
+    }
     gpu_sync();
     VkCommandBuffer cb = g_cb;
     uint32_t tw, th;
@@ -5357,7 +5368,13 @@ static void scene_fx(GfxTex* color, const GfxScene* s)
         u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
         u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
         if (g_fxs.water > 0.0f && have_v)
+        {
+            if (g_ts_on > 0)
+                ts_mark(TS_WATER);
             water_scene(s, vinv, &u, ct);
+            if (g_ts_on > 0)
+                ts_mark(TS_FX);
+        }
         const VkFormat F16 = VK_FORMAT_R16G16B16A16_SFLOAT;
         /* the world for rays, before the passes that trace them */
         int rt = 0;
@@ -5387,6 +5404,8 @@ static void scene_fx(GfxTex* color, const GfxScene* s)
             }
             if (g_fx.comp_pipe)
             {
+                if (g_ts_on > 0)
+                    ts_mark(TS_COPY);
                 gpu_sync();
                 image_copy(ct, g_fx.src, VK_IMAGE_ASPECT_COLOR_BIT);
                 g_dirty = 1;
