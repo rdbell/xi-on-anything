@@ -169,7 +169,10 @@ Visibility on desktop is decided in the shared Direct3D 8 front end (`d3d8.c`, `
 Vulkan, D3D12 and Metal all get the same policy. The game's 16x16 occlusion probe reads fully
 visible with no GPU read (`FFXI_PROBE=gpu` reads it), and the sun's sky probe reads the newest
 completed copy, a frame or more late, through `gfx_tex_read_async`, which all three renderers
-implement. So there is no synchronous wait on desktop for keyed visibility to remove: the Android
+implement. Since nothing reads a character's probe then, its draws are dropped too (`d3d8_probe_test`,
+wrapping the game's probe on the 2025-11-12 build): two screen-space quads of up to 3,000x3,000 pixels each into
+a 4096x4096 target, up to 12 a frame. On a Radeon 8060S that took mob spells with effects off from 117 to 151
+FPS, and crowds with default effects 10-16% higher. So there is no synchronous wait on desktop for keyed visibility to remove: the Android
 speedup came from replacing the Android baseline's exact reads (`FFXI_PROBE=gpu`) and does not
 carry over. Keyed visibility stays Android-only until a desktop renderer reads probes exactly.
 
