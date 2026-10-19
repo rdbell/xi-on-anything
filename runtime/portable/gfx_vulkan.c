@@ -1,8 +1,8 @@
 /* The graphics back end on Vulkan 1.3 (Linux): what gfx.h asks for, on one VkDevice. The same model
  * as the Metal one (gfx_metal.m), mapped onto Vulkan:
  *
- *   - Frames: one command buffer at a time, submitted at Present (or when the CPU needs a result, or
- *     in chunks of draws); up to three frames in flight, each with its own upload ring - vertex,
+ *   - Frames: one command buffer at a time, submitted at Present (or when the CPU needs a result);
+ *     up to three frames in flight, each with its own upload ring - vertex,
  *     index and uniform bytes are copied into the ring per draw, so the game may rewrite a buffer the
  *     moment a draw returns, as D3D lets it. One timeline semaphore counts the submissions; a frame is
  *     done when it reaches the value of the frame's last one.
@@ -218,7 +218,6 @@ static VkCommandBuffer g_upcb; /* uploads to submit ahead of g_cb */
 static uint64_t g_cb_index = 1;
 static int g_in_pass, g_dirty;
 static int g_up_dirty; /* the uploads' command buffer cleared a new texture since its last barrier */
-static uint32_t g_cmd_draws;
 
 static VkDescriptorSetLayout g_dsl, g_util_dsl;
 static VkPipelineLayout g_layout, g_util_layout;
@@ -649,7 +648,6 @@ static void submit_ex(int wait, VkSemaphore wait_sem, VkSemaphore signal_sem)
     g_frames[g_frame].value = value;
     g_cb = g_upcb = VK_NULL_HANDLE;
     g_cb_index++;
-    g_cmd_draws = 0;
     if (wait)
         wait_value(value);
 }
@@ -1164,11 +1162,10 @@ void gfx_copy(GfxTex* src, uint32_t sface, uint32_t slevel, uint32_t sx, uint32_
 }
 
 /* --- render passes --------------------------------------------------------------------------------------------- */
-/* Draws recorded since the last submission. A frame goes to the GPU in chunks - submitted when a pass
- * ends with this many behind it - so the GPU works while the game builds the rest, and a mid-frame
- * readback (the game's per-frame probe) waits only for the tail. */
-#define CHUNK_DRAWS 96
-#define SPLIT_DRAWS 320
+/* A frame goes to the GPU in one submission, at Present (or earlier where a readback must wait for it). It used
+ * to go in chunks of ~100 draws so the GPU could start early, but the GPU works on the previous frame meanwhile,
+ * and the extra submissions cost: with effects off, one per frame was 2-7% faster in every replay scene, and
+ * the GPU's clock could rise where it had thermal headroom. */
 
 static void color_size(uint32_t* w, uint32_t* h) { level_size(g_rt, g_rt_level, w, h); }
 
@@ -1258,8 +1255,6 @@ void gfx_set_targets(GfxTex* color, uint32_t face, uint32_t level, GfxTex* depth
     g_rt = color, g_rt_face = face, g_rt_level = level, g_ds = depth;
     if (g_in_pass)
         end_pass();
-    if (g_cmd_draws >= CHUNK_DRAWS && g_cb)
-        submit(0);
 }
 
 /* --- shaders and pipelines, built off the game's thread ---------------------------------------------------
@@ -2327,14 +2322,6 @@ void gfx_draw(const GfxDraw* d)
     uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
     scene_mips(d);
     draw_encode(d);
-    g_cmd_draws++;
-    /* a long pass (the 3D scene) goes to the GPU in pieces too: end it here, submit, and the next draw
-     * resumes it with its contents loaded */
-    if (g_cmd_draws >= SPLIT_DRAWS && g_in_pass)
-    {
-        end_pass();
-        submit(0);
-    }
     if (gfx_profiling)
         g_prof.draw_ns += gfx_now_ns() - t0, g_prof.draws++;
 }
