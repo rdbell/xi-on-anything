@@ -1458,6 +1458,12 @@ static void IDirect3D8_CreateDevice(Guest* g)
         d->pp[i] = rd32(ARG(5) + 4u * (uint32_t)i);
     d->hwnd = d->pp[6] ? d->pp[6] : ARG(3);
     d->behavior = ARG(4);
+    /* Direct3D 8 without D3DCREATE_FPU_PRESERVE (0x2) sets the calling thread's x87 to 24-bit
+     * precision, as FFXI's math then runs on the PC. At 53 bits a value in st(0) can compare
+     * greater than its own copy stored as a float: the Tab target's pick cycled between two
+     * targets of equal float distance, A -> B -> A, and never ended (the game froze). */
+    if (!(d->behavior & 0x2u))
+        g->fcw &= ~0x300u;
     d->device_type = ARG(2);
     d->d3d = ARG(0);
     if (!d->pp[0] || !d->pp[1])
